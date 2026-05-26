@@ -1,6 +1,7 @@
 import qupath.lib.objects.PathObjects
 import qupath.lib.roi.GeometryTools
 import qupath.lib.objects.classes.PathClass
+import qupath.lib.common.ColorTools
 
 import org.locationtech.jts.linearref.LengthIndexedLine
 import org.locationtech.jts.geom.Coordinate
@@ -9,6 +10,8 @@ import org.locationtech.jts.geom.GeometryFactory
 import org.locationtech.jts.geom.*
 import org.locationtech.jts.geom.util.AffineTransformation
 import org.locationtech.jts.geom.util.LinearComponentExtracter
+
+import javafx.application.Platform
 
 
 //-----------------------Functions-----------------------------------
@@ -206,6 +209,40 @@ def rayCast(Coordinate coord, Geometry to, Geometry inside,
     return validRays.min { r -> r.getLength() }
 }
 
+def updatePathClasses() {
+    def project = getProject()
+    try {
+        projectClasses = project.getPathClasses()
+    }catch (Exception e) {
+        projectClasses = [PathClass.NULL_CLASS] 
+    }
+    
+    def pathClasses = getQuPath().getAvailablePathClasses()
+    
+    requestedClasses = [
+                        PathClass.getInstance("BackGround", ColorTools.BLACK),
+                        PathClass.getInstance("Gray", ColorTools.CYAN), 
+                        PathClass.getInstance("White", ColorTools.WHITE),
+                        PathClass.getInstance("PtoB", ColorTools.makeRGB(128, 0, 128)),
+                        PathClass.getInstance("BtoP", ColorTools.MAGENTA)
+                        ]
+    
+    for (c in requestedClasses) {
+        if (pathClasses.contains(c)) {
+           //debug //print  "${c} is in requestedClasses"
+        }
+        else {
+           projectClasses << c
+           //debug //print "${c} is NOW in requestedClasses"
+    }
+}
+
+//debug //print projectClasses
+
+Platform.runLater {
+    pathClasses.setAll(projectClasses)
+}
+}
 //--------------------------------Main body------------------------------
 
 imageData = getCurrentImageData()
