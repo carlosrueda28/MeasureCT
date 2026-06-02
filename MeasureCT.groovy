@@ -10,6 +10,8 @@ import org.locationtech.jts.geom.GeometryFactory
 import org.locationtech.jts.geom.*
 import org.locationtech.jts.geom.util.AffineTransformation
 import org.locationtech.jts.geom.util.LinearComponentExtracter
+import org.locationtech.jts.linearref.LinearLocation
+import org.locationtech.jts.operation.linemerge.LineSequencer
 
 import javafx.application.Platform
 
@@ -33,6 +35,8 @@ def createCortMeasurements(Geometry from, Geometry to,
                             Geometry inside = gr, String lineClass) {
     //List of valid lines
     def lines = []
+    def cLines = []
+    def prevLine = null
     //List of start coordinate of invalid lines
     def crossCoords = []
     //Total length of main annotation boundary to create one line
@@ -46,10 +50,21 @@ def createCortMeasurements(Geometry from, Geometry to,
         pair = DistanceOp.nearestPoints(point, to)
         line = gf.createLineString([pair[0], pair[1]] as Coordinate[])
         
+        def liLine = new LengthIndexedLine(line)
+        endIndex = line.getLength()
+        start = 0 + (endIndex*0.01)
+        end = endIndex*0.99
+        
+        lineSegment = liLine.extractLine(start, end)
+        
+        
+        
         //checks validity of line, and if not valid its saved to 
         //make raycast later
-        if (! gr.covers(line)) {
+        if (! gr.covers(lineSegment)) {
            crossCoords << c
+           cLines << line
+           //visionCone(prevLine)
         }
         
         //checks if line is less than 5mm, if not is invalid
@@ -58,10 +73,14 @@ def createCortMeasurements(Geometry from, Geometry to,
         
         else {
            lines << line
+           prevLine = line
         }
     }
     
+    
+    
     //Make raycast 
+    
     for (coord in crossCoords) {
        line = rayCast(coord, to, inside)
        if (! line) { 
@@ -80,8 +99,63 @@ def createCortMeasurements(Geometry from, Geometry to,
         detection.setPathClass(PathClass.fromString(lineClass))
         linesROI << detection 
         }
+        
+    for (l in cLines) {
+        roi = GeometryTools.geometryToROI(l, plane)
+        detection = PathObjects.createDetectionObject(roi)
+        crossLines << detection 
+        }
 }
 }
+
+def visionCone (line){
+    Coordinate p0 = line.getCoordinateN(0)
+    Coordinate p1 = line.getCoordinateN(1)
+    
+    double dx = p1.x - p0.x
+    double dy = p1.y - p0.y
+    
+    double norm = Math.sqrt(dx*dx + dy*dy)
+    
+    dx /= norm
+    dy /= norm
+    
+    double coneLength = 20000
+    double halfAngle = Math.toRadians(60)
+    
+    double cosA = Math.cos(halfAngle)
+    double sinA = Math.sin(halfAngle)
+    
+    double lx = dx*cosA - dy*sinA
+    double ly = dx*sinA + dy*cosA
+    
+    double rx = dx*cosA + dy*sinA
+    double ry = -dx*sinA + dy*cosA
+    
+    Coordinate apex = p0
+    
+    Coordinate left = new Coordinate(
+        apex.x + lx*coneLength,
+        apex.y + ly*coneLength
+    )
+    
+    Coordinate right = new Coordinate(
+        apex.x + rx*coneLength,
+        apex.y + ry*coneLength
+    )
+    
+    Polygon cone = gf.createPolygon([
+        apex,
+        left,
+        right,
+        apex
+    ] as Coordinate[])
+    
+    roi = GeometryTools.geometryToROI(cone, plane)
+    det = PathObjects.createDetectionObject(roi)
+    addObject(det)
+}
+
 
 /**
  * Extract only linear geometries from a geometry collection.
@@ -196,7 +270,15 @@ def rayCast(Coordinate coord, Geometry to, Geometry inside,
         ] as Coordinate[])
 
         // ---- filters ----
-        if (! inside.covers(clippedRay))
+        def liLine = new LengthIndexedLine(clippedRay)
+        endIndex = clippedRay.getLength()
+        start = 0 + (endIndex*0.001)
+        end = endIndex*0.999
+        
+        lineSegment = liLine.extractLine(start, end)
+        
+        
+        if (! inside.covers(lineSegment))
             continue
 
         validRays << clippedRay
@@ -261,6 +343,7 @@ for (a in annotations) {
    }
    else if (classification == "White") {
        wh = a.getROI().getGeometry()
+       whAnnotation = a
    }
    else if (classification == "Gray") {
        gr = a.getROI().getGeometry()
@@ -268,21 +351,115 @@ for (a in annotations) {
    }
 }
 
+
+
 //Generate cortical interfaces
 pial = bg.intersection(gr.getBoundary()) //Pial boundary
 bound = gr.intersection(wh.getBoundary()) //gray-white boundary
 
+
+
 //Measurement parameters
 crossCoords = []
+crossLines = []
 step = 1000 // in pixels (1000 pixels == 250um)
 linesROI = []
 
+deselectAll()
+selectObjects { it.getPathClass() == getPathClass("Gray") }
+runPlugin('qupath.lib.plugins.objects.SplitAnnotationsPlugin', '{}')
+
+grayAnns = getAnnotationObjects().findAll {
+    it.getPathClass() == getPathClass("Gray")
+    }
+
+validPialSegments = []
+
+for (a in grayAnns) {
+    aGeom = a.getROI().getGeometry()
+    p = bg.intersection(aGeom.getBoundary()) //Pial boundary
+    if (p == null || p.isEmpty())
+        continue
+    if (p.getLength() < 40000)
+        continue
+
+    p = LineSequencer.sequence(p)
+    
+    
+    //Debug only
+    roi = GeometryTools.geometryToROI(p, plane)
+    ann = PathObjects.createAnnotationObject(roi)
+    addObject(ann)
+    
+    
+
+    if (p instanceof LineString) {
+        validPialSegments << p
+    
+    } else if (p instanceof MultiLineString) {
+    
+        def endpointCounts = [:]
+
+        for (int i = 0; i < p.getNumGeometries(); i++) {
+        
+            LineString line = p.getGeometryN(i)
+        
+            def start = line.getCoordinateN(0)
+            def end   = line.getCoordinateN(line.getNumPoints()-1)
+        
+            [start, end].each { c ->
+        
+                def key = "${c.x},${c.y}"
+        
+                endpointCounts[key] = (endpointCounts[key] ?: 0) + 1
+            }
+        }
+        
+        if (! endpointCounts.containsValue(1)) {
+    
+            for (int i = 0; i < p.getNumGeometries(); i++) {
+                validPialSegments << p.getGeometryN(i)
+            }
+            
+            
+    
+        } else {
+    
+            lila = new LengthIndexedLine(p)
+            p = lila.extractLine(20000, p.getLength() - 20000)
+            
+            //Debug only
+            roi = GeometryTools.geometryToROI(p, plane)
+            ann = PathObjects.createAnnotationObject(roi)
+            addObject(ann)
+    
+            for (int i = 0; i < p.getNumGeometries(); i++) {
+                validPialSegments << p.getGeometryN(i)
+            }
+            
+        }
+    }
+}
+
+mergedPial = gf.createMultiLineString(validPialSegments as LineString[])
+
+
+
+
+
+selectObjects { it.getPathClass() == getPathClass("Gray") }
+clearSelectedObjects()
+addObject(grAnnotation)
+
+
+
 //Create measurements in both directions
-createCortMeasurements(pial, bound, "PtoB")
-createCortMeasurements(bound, pial, "BtoP")
+createCortMeasurements(mergedPial, bound, "PtoB") 
+createCortMeasurements(bound, mergedPial, "BtoP")
 
 //addObjects(linesROI)
 grAnnotation.addChildObjects(linesROI)
+grAnnotation.addChildObjects(crossLines) //Debug only
 selectDetections()
 addShapeMeasurements("LENGTH")
 resetSelection()
