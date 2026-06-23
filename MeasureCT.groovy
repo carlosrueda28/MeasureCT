@@ -12,6 +12,7 @@ import org.locationtech.jts.geom.util.AffineTransformation
 import org.locationtech.jts.geom.util.LinearComponentExtracter
 import org.locationtech.jts.linearref.LinearLocation
 import org.locationtech.jts.operation.linemerge.LineSequencer
+import org.locationtech.jts.operation.linemerge.LineMerger
 
 import javafx.application.Platform
 
@@ -365,93 +366,79 @@ crossLines = []
 step = 1000 // in pixels (1000 pixels == 250um)
 linesROI = []
 
-deselectAll()
-selectObjects { it.getPathClass() == getPathClass("Gray") }
-runPlugin('qupath.lib.plugins.objects.SplitAnnotationsPlugin', '{}')
-
-grayAnns = getAnnotationObjects().findAll {
-    it.getPathClass() == getPathClass("Gray")
-    }
 
 validPialSegments = []
 
-for (a in grayAnns) {
-    aGeom = a.getROI().getGeometry()
-    p = bg.intersection(aGeom.getBoundary()) //Pial boundary
-    if (p == null || p.isEmpty())
-        continue
-    if (p.getLength() < 40000)
-        continue
+p = LineSequencer.sequence(pial)
 
-    p = LineSequencer.sequence(p)
-    
-    
-    //Debug only
-    roi = GeometryTools.geometryToROI(p, plane)
+def merger = new LineMerger()
+merger.add(p)
+def merged = merger.getMergedLineStrings()
+for (m in merged) {
+    /* //Debug only
+    roi = GeometryTools.geometryToROI(m, plane)
+
     ann = PathObjects.createAnnotationObject(roi)
+
     addObject(ann)
-    
-    
+    */
+    if (m.getLength() < 30000)
+        continue
 
-    if (p instanceof LineString) {
-        validPialSegments << p
-    
-    } else if (p instanceof MultiLineString) {
-    
-        def endpointCounts = [:]
+    def endpointCounts = [:]
 
-        for (int i = 0; i < p.getNumGeometries(); i++) {
+    for (int i = 0; i < m.getNumGeometries(); i++) {
+
+        LineString line = m.getGeometryN(i)
+
+        def start = line.getCoordinateN(0)
+        def end   = line.getCoordinateN(line.getNumPoints()-1)
+
+        [start, end].each { c ->
+
+            def key = "${c.x},${c.y}"
+
+            endpointCounts[key] = (endpointCounts[key] ?: 0) + 1
+
+        }
+        }
         
-            LineString line = p.getGeometryN(i)
-        
-            def start = line.getCoordinateN(0)
-            def end   = line.getCoordinateN(line.getNumPoints()-1)
-        
-            [start, end].each { c ->
-        
-                def key = "${c.x},${c.y}"
-        
-                endpointCounts[key] = (endpointCounts[key] ?: 0) + 1
+        if (!endpointCounts.containsValue(1)) {
+
+            for (int i = 0; i < m.getNumGeometries(); i++) {
+                validPialSegments << m.getGeometryN(i)
             }
         }
         
-        if (! endpointCounts.containsValue(1)) {
-    
-            for (int i = 0; i < p.getNumGeometries(); i++) {
-                validPialSegments << p.getGeometryN(i)
+        
+        else {
+
+            lila = new LengthIndexedLine(m)
+
+            m = lila.extractLine(
+                20000,
+                m.getLength() - 20000
+            )
+
+            for (int i = 0; i < m.getNumGeometries(); i++) {
+                validPialSegments << m.getGeometryN(i)
             }
             
-            
-    
-        } else {
-    
-            lila = new LengthIndexedLine(p)
-            p = lila.extractLine(20000, p.getLength() - 20000)
-            
-            //Debug only
-            roi = GeometryTools.geometryToROI(p, plane)
-            ann = PathObjects.createAnnotationObject(roi)
-            addObject(ann)
-    
-            for (int i = 0; i < p.getNumGeometries(); i++) {
-                validPialSegments << p.getGeometryN(i)
-            }
-            
+
         }
+
+        /* //Debug only
+        roi = GeometryTools.geometryToROI(m, plane)
+
+        ann = PathObjects.createAnnotationObject(roi)
+
+        addObject(ann)
+        */
+
     }
-}
+
 
 mergedPial = gf.createMultiLineString(validPialSegments as LineString[])
-
-
-
-
-
-selectObjects { it.getPathClass() == getPathClass("Gray") }
-clearSelectedObjects()
-addObject(grAnnotation)
-
-
 
 //Create measurements in both directions
 createCortMeasurements(mergedPial, bound, "PtoB") 
@@ -459,7 +446,7 @@ createCortMeasurements(bound, mergedPial, "BtoP")
 
 //addObjects(linesROI)
 grAnnotation.addChildObjects(linesROI)
-grAnnotation.addChildObjects(crossLines) //Debug only
+//grAnnotation.addChildObjects(crossLines) //Debug only
 selectDetections()
 addShapeMeasurements("LENGTH")
 resetSelection()
