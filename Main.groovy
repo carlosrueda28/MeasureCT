@@ -3,10 +3,14 @@ import javafx.stage.Stage
 import javafx.scene.Scene
 import javafx.scene.control.Button
 import javafx.scene.layout.VBox
+import javafx.scene.layout.HBox
 import javafx.scene.layout.GridPane
 import javafx.scene.control.Label
 import javafx.scene.control.TextField
+import javafx.scene.control.Slider
+import javafx.scene.control.ScrollPane
 import qupath.lib.roi.GeometryTools
+import javafx.beans.property.SimpleObjectProperty
 
 import org.locationtech.jts.geom.Geometry
 import org.locationtech.jts.geom.GeometryFactory
@@ -34,6 +38,7 @@ import qupath.lib.objects.PathObjects
 import qupath.lib.roi.GeometryTools
 import qupath.lib.objects.classes.PathClass
 import qupath.lib.common.ColorTools
+import qupath.lib.regions.ImagePlane
 
 import org.locationtech.jts.linearref.LengthIndexedLine
 import org.locationtech.jts.geom.Coordinate
@@ -47,6 +52,135 @@ import org.locationtech.jts.operation.linemerge.LineSequencer
 import org.locationtech.jts.operation.linemerge.LineMerger
 
 import javafx.application.Platform
+import groovy.transform.Field
+
+import qupath.lib.gui.viewer.QuPathViewer
+import qupath.lib.gui.viewer.overlays.AbstractOverlay
+import qupath.lib.images.ImageData
+import qupath.lib.regions.ImageRegion
+
+import java.awt.*
+import java.awt.image.BufferedImage
+
+
+@Field
+SliceBoundaries sliceBoundaries
+
+class SliceBoundaries {
+    
+    Geometry pial
+    Geometry bound
+    final fragmentsProperty = new SimpleObjectProperty<List>()
+    java.util.List<List> validPialSegments
+    java.util.List<List> fragmentsGUI
+    Geometry mergedPial
+    boolean showFragments
+    
+    int lengthTreshold = 30000
+    
+    SliceBoundaries(Geometry bgGeom, Geometry grGeom, Geometry whGeom, ImagePlane plane) {
+        refresh(bgGeom, grGeom, whGeom, plane)
+    }
+    
+    void refresh(Geometry bgGeom, Geometry grGeom, Geometry whGeom, ImagePlane plane) {
+            //Generate cortical interfaces
+            
+            def gf = new GeometryFactory()
+            
+            this.pial = bgGeom.intersection(grGeom.getBoundary()) //Pial boundary
+            this.bound = grGeom.intersection(whGeom.getBoundary()) //gray-white boundary
+            this.validPialSegments = []
+            this.fragmentsGUI = []
+    
+            def p = LineSequencer.sequence(pial)
+            
+            def merger = new LineMerger()
+            merger.add(p)
+            def merged = merger.getMergedLineStrings()
+            for (m in merged) {
+                /* //Debug only
+                def roi = GeometryTools.geometryToROI(m, plane)
+            
+                def ann = PathObjects.createAnnotationObject(roi)
+            
+                addObject(ann)
+                */
+                
+                //Ignore small fragments
+                if (m.getLength() < lengthTreshold)
+                    continue
+            
+                def endpointCounts = [:]
+                
+                
+                //Gather information to check if fragment is closed loop
+                for (int i = 0; i < m.getNumGeometries(); i++) {
+            
+                    LineString line = m.getGeometryN(i)
+            
+                    def start = line.getCoordinateN(0)
+                    def end   = line.getCoordinateN(line.getNumPoints()-1)
+            
+                    [start, end].each { c ->
+            
+                        def key = "${c.x},${c.y}"
+            
+                        endpointCounts[key] = (endpointCounts[key] ?: 0) + 1
+            
+                    }
+                    }
+                    //If fragment is a closed loop, add as it is
+                    if (!endpointCounts.containsValue(1)) {
+            
+                        def empty = gf.createLineString(new Coordinate[0])
+                        fragmentsGUI << [m,[empty, empty]]
+                        
+                        for (int i = 0; i < m.getNumGeometries(); i++) {
+                            validPialSegments << m.getGeometryN(i)
+                        }
+                    }
+                    
+                    //if fragment is not a closed loop, trim it
+                    else {
+            
+                        def totalLength = m.getLength()
+                        def lila = new LengthIndexedLine(m)
+            
+                        m = lila.extractLine(
+                            20000,
+                            totalLength - 20000
+                        )
+                        
+                        def startCut = lila.extractLine(0, 20000)
+                        def endCut = lila.extractLine(totalLength - 20000, totalLength)
+                        
+                        fragmentsGUI << [m, [startCut, endCut]]
+            
+                        for (int i = 0; i < m.getNumGeometries(); i++) {
+                            validPialSegments << m.getGeometryN(i)
+                        }
+                        
+            
+                    }
+            
+                    /* //Debug only
+                    roi = GeometryTools.geometryToROI(m, plane)
+            
+                    ann = PathObjects.createAnnotationObject(roi)
+            
+                    addObject(ann)
+                    */
+            
+                }
+            
+            fragmentsProperty.set(fragmentsGUI)
+            this.mergedPial = gf.createMultiLineString(validPialSegments as LineString[])
+            
+            
+            
+            }
+}
+
 
 def tileCreation() {
     setImageType('BRIGHTFIELD_H_DAB')
@@ -81,6 +215,13 @@ def annCreator(updateOnly = false) {
             // ============================================================================
             // CONVERT TILE CLASSIFICATIONS TO CLEAN ANNOTATIONS
             // ============================================================================
+            
+            getAnnotationObjects().each { a ->
+                if (! a.hasChildObjects()) {
+                    selectObjects(a)
+                    clearSelectedObjects()
+                }
+            }
             
             selectAnnotations()
             
@@ -201,8 +342,15 @@ def annCreator(updateOnly = false) {
     // ============================================================================
     // REPLACE EXISTING ANNOTATIONS
     // ============================================================================
+
+
+    sliceBoundaries.refresh(backgroundSmooth, graySmooth, whiteSmooth, plane)
+
+    
     
     clearAnnotations()
+    
+    
     
     
     // ============================================================================
@@ -508,15 +656,12 @@ def rayCast(Coordinate coord, Geometry to, Geometry inside,
 
 def updatePathClasses() {
     def project = getProject()
-    try {
-        projectClasses = project.getPathClasses()
-    }catch (Exception e) {
-        projectClasses = [PathClass.NULL_CLASS] 
-    }
+    if (project == null)
+        return
     
-    def pathClasses = getQuPath().getAvailablePathClasses()
+    def projectClasses = new ArrayList<>(project.getPathClasses())
     
-    requestedClasses = [
+    def requestedClasses = [
                         PathClass.getInstance("BackGround", ColorTools.BLACK),
                         PathClass.getInstance("Gray", ColorTools.CYAN), 
                         PathClass.getInstance("White", ColorTools.WHITE),
@@ -524,21 +669,15 @@ def updatePathClasses() {
                         PathClass.getInstance("BtoP", ColorTools.MAGENTA)
                         ]
     
-    for (c in requestedClasses) {
-        if (pathClasses.contains(c)) {
-           //debug //print  "${c} is in requestedClasses"
-        }
-        else {
-           projectClasses << c
-           //debug //print "${c} is NOW in requestedClasses"
+    requestedClasses.each { c ->
+        if (!projectClasses.any { it == c })
+            projectClasses.add(c)
     }
-}
+    
+    project.setPathClasses(projectClasses)
+    project.syncChanges()
 
 //debug //print projectClasses
-
-Platform.runLater {
-    pathClasses.setAll(projectClasses)
-}
 }
 
 def MeasureCT() {
@@ -566,14 +705,8 @@ def MeasureCT() {
        }
     }
     
-    
-    
-    //Generate cortical interfaces
-    pial = bg.intersection(gr.getBoundary()) //Pial boundary
-    bound = gr.intersection(wh.getBoundary()) //gray-white boundary
-    
-    
-    
+    def bounds = new SliceBoundaries(bg, gr, wh, plane)
+        
     //Measurement parameters
     crossCoords = []
     crossLines = []
@@ -581,82 +714,10 @@ def MeasureCT() {
     linesROI = []
     
     
-    validPialSegments = []
-    
-    p = LineSequencer.sequence(pial)
-    
-    def merger = new LineMerger()
-    merger.add(p)
-    def merged = merger.getMergedLineStrings()
-    for (m in merged) {
-        /* //Debug only
-        roi = GeometryTools.geometryToROI(m, plane)
-    
-        ann = PathObjects.createAnnotationObject(roi)
-    
-        addObject(ann)
-        */
-        if (m.getLength() < 30000)
-            continue
-    
-        def endpointCounts = [:]
-    
-        for (int i = 0; i < m.getNumGeometries(); i++) {
-    
-            LineString line = m.getGeometryN(i)
-    
-            def start = line.getCoordinateN(0)
-            def end   = line.getCoordinateN(line.getNumPoints()-1)
-    
-            [start, end].each { c ->
-    
-                def key = "${c.x},${c.y}"
-    
-                endpointCounts[key] = (endpointCounts[key] ?: 0) + 1
-    
-            }
-            }
-            
-            if (!endpointCounts.containsValue(1)) {
-    
-                for (int i = 0; i < m.getNumGeometries(); i++) {
-                    validPialSegments << m.getGeometryN(i)
-                }
-            }
-            
-            
-            else {
-    
-                lila = new LengthIndexedLine(m)
-    
-                m = lila.extractLine(
-                    20000,
-                    m.getLength() - 20000
-                )
-    
-                for (int i = 0; i < m.getNumGeometries(); i++) {
-                    validPialSegments << m.getGeometryN(i)
-                }
-                
-    
-            }
-    
-            /* //Debug only
-            roi = GeometryTools.geometryToROI(m, plane)
-    
-            ann = PathObjects.createAnnotationObject(roi)
-    
-            addObject(ann)
-            */
-    
-        }
-    
-    
-    mergedPial = gf.createMultiLineString(validPialSegments as LineString[])
     
     //Create measurements in both directions
-    createCortMeasurements(mergedPial, bound, "PtoB", linesROI) 
-    createCortMeasurements(bound, mergedPial, "BtoP", linesROI)
+    createCortMeasurements(bounds.mergedPial, bounds.bound, "PtoB", linesROI) 
+    createCortMeasurements(bounds.bound, bounds.mergedPial, "BtoP", linesROI)
     
     addObjects(linesROI)
     //grAnnotation.addChildObjects(linesROI)
@@ -666,6 +727,97 @@ def MeasureCT() {
     resetSelection()
 }
 
+class DynamicLengthSlider {
+    int totalLength
+    int startFragmentLength
+    int endFragmentLength
+    HBox gui
+    
+   DynamicLengthSlider(lilTotalLength, lilStartFragmentLength, lilEndFragmentLength, i) {
+       
+       def totalLength = lilTotalLength/4000
+       def startFragmentLength = lilStartFragmentLength/4000
+       def endFragmentLength = lilEndFragmentLength/4000
+       
+       def segmentHBox = new HBox()
+       segmentHBox.getChildren().add(new Label(i.toString()))
+       
+       def startHBox = new HBox()
+       startHBox.getChildren().add(new Label("Start"))
+       def startSlider = new Slider(0,totalLength/2, startFragmentLength)
+       startSlider.setShowTickLabels(true)
+       startHBox.getChildren().add(startSlider)
+       def startValue = new Label(startSlider.getValue().toString())
+       startValue.textProperty().bind(
+           startSlider.valueProperty().asString("%.1f")
+       )
+       startHBox.getChildren().add(startValue)
+       
+
+       
+       
+       
+       def endHBox = new HBox()
+       endHBox.getChildren().add(new Label("End"))
+       def endSlider = new Slider(0, totalLength/2, endFragmentLength)
+       endSlider.setShowTickLabels(true)
+       endHBox.getChildren().add(endSlider)
+       def endValue = new Label(endSlider.getValue().toString())
+       endValue.textProperty().bind(
+           endSlider.valueProperty().asString("%.1f")
+       )
+       endHBox.getChildren().add(endValue)
+       
+       def fragmentVBox = new VBox()
+       fragmentVBox.getChildren().add(startHBox)
+       fragmentVBox.getChildren().add(endHBox)
+       segmentHBox.getChildren().add(fragmentVBox)
+       
+       this.gui = segmentHBox
+       
+   }
+}
+
+class FragmentOverlay extends AbstractOverlay {
+
+    QuPathViewer viewer
+    SliceBoundaries slice
+
+    FragmentOverlay(QuPathViewer viewer, SliceBoundaries slice) {
+        super(viewer.getOverlayOptions())
+        this.viewer = viewer
+        this.slice = slice
+    }
+
+    @Override
+    void paintOverlay(
+            Graphics2D g2d,
+            ImageRegion region,
+            double downsample,
+            ImageData<BufferedImage> imageData,
+            boolean paintCompletely
+    ) {
+
+        slice.fragmentsGUI.flatten().each { geo ->
+            def roi = GeometryTools.geometryToROI(geo, ImagePlane.getDefaultPlane())
+            Shape shape = roi.getShape()
+            g2d.draw(shape)
+
+            
+        }
+    }
+}
+
+updatePathClasses()
+
+def plane = ImagePlane.getDefaultPlane()
+
+def roi = ROIs.createRectangleROI(0, 0, 1, 1, plane)
+
+def geo = roi.getGeometry()
+
+sliceBoundaries = new SliceBoundaries(geo, geo, geo, plane)
+
 Platform.runLater {
 
     Stage stage = new Stage()
@@ -674,8 +826,13 @@ Platform.runLater {
     
     Button tilesBtn = new Button("Run")
     tilesBtn.setOnAction {
-        
-        tileCreation()
+        Thread.startDaemon {
+           try {
+              tileCreation() 
+           }catch (Exception e) {
+              e.printStackTrace() 
+           }
+        }
     }
     grid.add(new Label("Create tiles"), 0, 0)
     grid.add(tilesBtn, 1, 0)
@@ -691,8 +848,26 @@ Platform.runLater {
     annBtn.setOnAction {
         annCreator()
     }
+    
+    GridPane annGrid = new GridPane()
+    annGrid.add(new Label("Min fragment size"), 0, 0)
+    annGrid.add(new TextField("500000"), 1, 0)
+    annGrid.add(new Label("Max hole size"),0, 1)
+    annGrid.add(new TextField("500000"), 1, 1)
+    annGrid.add(new Label("Background simplification"), 0, 2)
+    annGrid.add(new TextField("500000"), 1, 2)
+    annGrid.add(new Label("Gray matter simplification"), 0, 3)
+    annGrid.add(new TextField("500000"), 1, 3)
+    annGrid.add(new Label("White matter simplification"), 0, 4)
+    annGrid.add(new TextField("500000"), 1, 4)
+    annGrid.add(new Label("Background buffer"), 0, 5)
+    annGrid.add(new TextField("500000"), 1, 5)
+    annGrid.add(new Label("Gray matter buffer"), 0, 6)
+    annGrid.add(new TextField("500000"), 1, 6)
+    annGrid.add(annBtn, 0, 7, 2, 1)
+    
     grid.add(new Label("Create annotations"), 0, 2)
-    grid.add(annBtn, 1, 2)
+    grid.add(annGrid, 1, 2)
     
     Button updateBtn = new Button("Update annotations")
     updateBtn.setOnAction {
@@ -703,16 +878,68 @@ Platform.runLater {
     
     Button measureBtn = new Button("Measure cortical thickness")
     measureBtn.setOnAction {
-        MeasureCT()
+        Thread.startDaemon {
+           try {
+              MeasureCT() 
+           } catch (Exception e) {
+              e.printStackTrace() 
+           }
+        }
     }
+    
+    GridPane measGrid = new GridPane()
+    measGrid.add(new Label("Define start and end segments"), 0, 0)
+    
+    VBox segmentVBox = new VBox()
+    
+    sliceBoundaries.fragmentsProperty.addListener { obs, oldValue, newValue ->
+        segmentVBox.getChildren().clear()
+        
+        for (f in newValue) {
+       
+           def totalLength = f[0].getLength() ?: 0
+           def startFragmentLength = f[1][0].getLength() ?: 0
+           def endFragmentLength = f[1][1].getLength() ?: 0
+           def index = segmentVBox.getChildren().size()
+           def dls = new DynamicLengthSlider(totalLength, startFragmentLength, endFragmentLength, index)           
+           
+           segmentVBox.getChildren().add(dls.gui)
+           
+           def viewer = getCurrentViewer()
+
+           viewer.getCustomOverlayLayers().removeIf {
+               it instanceof FragmentOverlay
+           }
+            
+           viewer.getCustomOverlayLayers().add(
+               new FragmentOverlay(viewer, sliceBoundaries)
+           )
+            
+           viewer.repaint()
+           
+           
+    
+        }
+    }
+
+    
+    measScrollPane = new ScrollPane()
+    measScrollPane.setContent(segmentVBox)
+    
+    measGrid.add(measScrollPane, 0, 1, 2, 1)
+    
+    measGrid.add(measureBtn, 0,2,2,1)
+    
     grid.add(new Label("Measure"), 0, 4)
-    grid.add(measureBtn, 1, 4)
+    grid.add(measGrid, 1, 4)
     
     Button showBtn = new Button("Show")
     grid.add(new Label("Show thickness measurements"), 0, 5)
     grid.add(showBtn, 1, 5)
 
-    Scene scene = new Scene(grid, 300, 200)
+    Scene scene = new Scene(grid, 500, 800)
+    
+    stage.setAlwaysOnTop(true)
 
     stage.setScene(scene)
     stage.setTitle("Cortical measurement")
