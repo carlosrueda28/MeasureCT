@@ -1,75 +1,57 @@
-import javafx.application.Platform
-import javafx.stage.Stage
-import javafx.scene.Scene
-import javafx.scene.control.Button
-import javafx.scene.layout.VBox
-import javafx.scene.layout.HBox
-import javafx.scene.layout.GridPane
-import javafx.scene.control.Label
-import javafx.scene.control.TextField
-import javafx.scene.control.Slider
-import javafx.scene.control.ScrollPane
-import qupath.lib.roi.GeometryTools
-import javafx.beans.property.SimpleObjectProperty
-
-import org.locationtech.jts.geom.Geometry
-import org.locationtech.jts.geom.GeometryFactory
-import org.locationtech.jts.simplify.VWSimplifier
-
-import qupath.lib.objects.PathObjects
-import qupath.lib.roi.GeometryTools
-import qupath.lib.objects.classes.PathClass
-import qupath.lib.common.ColorTools
-
-import org.locationtech.jts.linearref.LengthIndexedLine
-import org.locationtech.jts.geom.Coordinate
-import org.locationtech.jts.operation.distance.DistanceOp
-import org.locationtech.jts.geom.GeometryFactory
-import org.locationtech.jts.geom.*
-import org.locationtech.jts.geom.util.AffineTransformation
-import org.locationtech.jts.geom.util.LinearComponentExtracter
-import org.locationtech.jts.linearref.LinearLocation
-import org.locationtech.jts.operation.linemerge.LineSequencer
-import org.locationtech.jts.operation.linemerge.LineMerger
-
-import javafx.application.Platform
-
-import qupath.lib.objects.PathObjects
-import qupath.lib.roi.GeometryTools
-import qupath.lib.objects.classes.PathClass
-import qupath.lib.common.ColorTools
-import qupath.lib.regions.ImagePlane
-
-import org.locationtech.jts.linearref.LengthIndexedLine
-import org.locationtech.jts.geom.Coordinate
-import org.locationtech.jts.operation.distance.DistanceOp
-import org.locationtech.jts.geom.GeometryFactory
-import org.locationtech.jts.geom.*
-import org.locationtech.jts.geom.util.AffineTransformation
-import org.locationtech.jts.geom.util.LinearComponentExtracter
-import org.locationtech.jts.linearref.LinearLocation
-import org.locationtech.jts.operation.linemerge.LineSequencer
-import org.locationtech.jts.operation.linemerge.LineMerger
-
-import javafx.application.Platform
 import groovy.transform.Field
-
-import qupath.lib.gui.viewer.QuPathViewer
-import qupath.lib.gui.viewer.overlays.AbstractOverlay
-import qupath.lib.images.ImageData
-import qupath.lib.regions.ImageRegion
 
 import java.awt.*
 import java.awt.image.BufferedImage
+
+import javafx.application.Platform
+import javafx.beans.property.SimpleObjectProperty
+import javafx.scene.Scene
+import javafx.scene.control.Button
+import javafx.scene.control.Label
+import javafx.scene.control.ScrollPane
+import javafx.scene.control.Slider
+import javafx.scene.control.TextField
+import javafx.scene.layout.GridPane
+import javafx.scene.layout.HBox
+import javafx.scene.layout.VBox
+import javafx.stage.Stage
+
+import org.locationtech.jts.geom.*
+import org.locationtech.jts.geom.util.AffineTransformation
+import org.locationtech.jts.geom.util.LinearComponentExtracter
+import org.locationtech.jts.linearref.LengthIndexedLine
+import org.locationtech.jts.linearref.LinearLocation
+import org.locationtech.jts.operation.distance.DistanceOp
+import org.locationtech.jts.operation.linemerge.LineMerger
+import org.locationtech.jts.operation.linemerge.LineSequencer
+import org.locationtech.jts.simplify.VWSimplifier
+
+import qupath.lib.common.ColorTools
+import qupath.lib.gui.viewer.QuPathViewer
+import qupath.lib.gui.viewer.overlays.AbstractOverlay
+import qupath.lib.images.ImageData
+import qupath.lib.objects.PathObjects
+import qupath.lib.objects.classes.PathClass
+import qupath.lib.regions.ImagePlane
+import qupath.lib.regions.ImageRegion
+import qupath.lib.roi.GeometryTools
 
 
 @Field
 SliceBoundaries sliceBoundaries
 
+@Field
+FragmentOverlay fragmentOverlay
+
+@Field GeometryFactory gf = new GeometryFactory()
+
+@Field ImagePlane plane = ImagePlane.getDefaultPlane()
+
 class SliceBoundaries {
     
     Geometry pial
     Geometry bound
+    Geometry gray
     final fragmentsProperty = new SimpleObjectProperty<List>()
     java.util.List<List> validPialSegments
     java.util.List<List> fragmentsGUI
@@ -78,8 +60,22 @@ class SliceBoundaries {
     
     int lengthTreshold = 30000
     
+    Closure overlayUpdater
+    
     SliceBoundaries(Geometry bgGeom, Geometry grGeom, Geometry whGeom, ImagePlane plane) {
         refresh(bgGeom, grGeom, whGeom, plane)
+    }
+    
+    void updateMergedPial() {
+       def gf = new GeometryFactory()
+       validPialSegments.clear()
+       fragmentsGUI.each {dts ->
+       def geo = dts.geo
+       for (int i = 0; i < geo.getNumGeometries(); i++) {
+          validPialSegments << geo.getGeometryN(i)
+       }
+       this.mergedPial = gf.createMultiLineString(validPialSegments as LineString[]) 
+       }
     }
     
     void refresh(Geometry bgGeom, Geometry grGeom, Geometry whGeom, ImagePlane plane) {
@@ -89,6 +85,7 @@ class SliceBoundaries {
             
             this.pial = bgGeom.intersection(grGeom.getBoundary()) //Pial boundary
             this.bound = grGeom.intersection(whGeom.getBoundary()) //gray-white boundary
+            this.gray = grGeom
             this.validPialSegments = []
             this.fragmentsGUI = []
     
@@ -97,6 +94,7 @@ class SliceBoundaries {
             def merger = new LineMerger()
             merger.add(p)
             def merged = merger.getMergedLineStrings()
+            int fragmentIndex = 0
             for (m in merged) {
                 /* //Debug only
                 def roi = GeometryTools.geometryToROI(m, plane)
@@ -111,6 +109,7 @@ class SliceBoundaries {
                     continue
             
                 def endpointCounts = [:]
+                
                 
                 
                 //Gather information to check if fragment is closed loop
@@ -132,11 +131,19 @@ class SliceBoundaries {
                     //If fragment is a closed loop, add as it is
                     if (!endpointCounts.containsValue(1)) {
             
-                        def empty = gf.createLineString(new Coordinate[0])
-                        fragmentsGUI << [m,[empty, empty]]
+                        def lila = new LengthIndexedLine(m)
+                        def dls = new DynamicLengthSlider(lila, fragmentIndex)
+                        dls.onChange = {
+                            overlayUpdater?.call() 
+                        } as Runnable
+                        dls.changed = {
+                            updateMergedPial()
+                        } as Runnable
+                        fragmentsGUI << dls
+                        fragmentIndex++
                         
-                        for (int i = 0; i < m.getNumGeometries(); i++) {
-                            validPialSegments << m.getGeometryN(i)
+                        for (int j = 0; j < m.getNumGeometries(); j++) {
+                            validPialSegments << m.getGeometryN(j)
                         }
                     }
                     
@@ -151,10 +158,16 @@ class SliceBoundaries {
                             totalLength - 20000
                         )
                         
-                        def startCut = lila.extractLine(0, 20000)
-                        def endCut = lila.extractLine(totalLength - 20000, totalLength)
                         
-                        fragmentsGUI << [m, [startCut, endCut]]
+                        def dls = new DynamicLengthSlider(lila, fragmentIndex)
+                        dls.onChange = {
+                            overlayUpdater?.call() 
+                        } as Runnable
+                        dls.changed = {
+                            updateMergedPial()
+                        } as Runnable
+                        fragmentsGUI << dls
+                        fragmentIndex++
             
                         for (int i = 0; i < m.getNumGeometries(); i++) {
                             validPialSegments << m.getGeometryN(i)
@@ -174,10 +187,7 @@ class SliceBoundaries {
                 }
             
             fragmentsProperty.set(fragmentsGUI)
-            this.mergedPial = gf.createMultiLineString(validPialSegments as LineString[])
-            
-            
-            
+            this.mergedPial = gf.createMultiLineString(validPialSegments as LineString[])           
             }
 }
 
@@ -396,7 +406,7 @@ def annCreator(updateOnly = false) {
  */
 
 def createCortMeasurements(Geometry from, Geometry to,
-                            Geometry inside = gr, String lineClass, listLines) {
+                            Geometry inside, String lineClass, listLines) {
     //List of valid lines
     def lines = []
     def cLines = []
@@ -407,6 +417,7 @@ def createCortMeasurements(Geometry from, Geometry to,
     //detection every 250um.
     def totalLength = from.getLength() 
     def lil = new LengthIndexedLine(from)
+    def gf = new GeometryFactory()
     
     for (double d = 0; d <= totalLength; d += step) {
         Coordinate c = lil.extractPoint(d)
@@ -425,7 +436,7 @@ def createCortMeasurements(Geometry from, Geometry to,
         
         //checks validity of line, and if not valid its saved to 
         //make raycast later
-        if (! gr.covers(lineSegment)) {
+        if (! inside.covers(lineSegment)) {
            crossCoords << c
            cLines << line
            //visionCone(prevLine)
@@ -526,12 +537,11 @@ def visionCone (line){
  * (polygons, points, lines, geometry collections).
  */
 def extractLines(Geometry geom) {
+    def gf = new GeometryFactory()
     def lines = LinearComponentExtracter.getLines(geom)
 
     if (lines.isEmpty())
         return null
-
-    def gf = new GeometryFactory()
 
     return gf.buildGeometry(lines)
 }
@@ -554,6 +564,8 @@ def extractLines(Geometry geom) {
 def rayCast(Coordinate coord, Geometry to, Geometry inside,
                           int n = 180, double maxDist = 1e6) {
 
+    def gf = new GeometryFactory()
+    
     def validRays = []
     
     def newCoord = new Coordinate(point.getX() + maxDist, point.getY())
@@ -662,7 +674,7 @@ def updatePathClasses() {
     def projectClasses = new ArrayList<>(project.getPathClasses())
     
     def requestedClasses = [
-                        PathClass.getInstance("BackGround", ColorTools.BLACK),
+                        PathClass.getInstance("Background", ColorTools.BLACK),
                         PathClass.getInstance("Gray", ColorTools.CYAN), 
                         PathClass.getInstance("White", ColorTools.WHITE),
                         PathClass.getInstance("PtoB", ColorTools.makeRGB(128, 0, 128)),
@@ -680,33 +692,14 @@ def updatePathClasses() {
 //debug //print projectClasses
 }
 
-def MeasureCT() {
-    imageData = getCurrentImageData()
-    hierarchy = imageData.getHierarchy()
-    annotations = hierarchy.getAnnotationObjects()
+def MeasureCT(SliceBoundaries) {
     
-    plane = annotations[0].getROI().getImagePlane()
+    def mergedPial = SliceBoundaries.mergedPial
+    def bound = SliceBoundaries.bound
+    def gray = SliceBoundaries.gray
     
-    gf = new GeometryFactory()
     
-    //Retrieve annotations by class
-    for (a in annotations) {
-       def classification = a.getPathClass().toString()
-       if(classification == "Background") {
-          bg = a.getROI().getGeometry()
-       }
-       else if (classification == "White") {
-           wh = a.getROI().getGeometry()
-           whAnnotation = a
-       }
-       else if (classification == "Gray") {
-           gr = a.getROI().getGeometry()
-           grAnnotation = a
-       }
-    }
     
-    def bounds = new SliceBoundaries(bg, gr, wh, plane)
-        
     //Measurement parameters
     crossCoords = []
     crossLines = []
@@ -716,8 +709,8 @@ def MeasureCT() {
     
     
     //Create measurements in both directions
-    createCortMeasurements(bounds.mergedPial, bounds.bound, "PtoB", linesROI) 
-    createCortMeasurements(bounds.bound, bounds.mergedPial, "BtoP", linesROI)
+    createCortMeasurements(mergedPial, bound, gray, "PtoB", linesROI) 
+    createCortMeasurements(bound, mergedPial, gray, "BtoP", linesROI)
     
     addObjects(linesROI)
     //grAnnotation.addChildObjects(linesROI)
@@ -727,41 +720,106 @@ def MeasureCT() {
     resetSelection()
 }
 
-class DynamicLengthSlider {
-    int totalLength
-    int startFragmentLength
-    int endFragmentLength
-    HBox gui
+def updateOverlay(closeWindow = false) {
+
+    def viewer = getCurrentViewer()
+
+    if (fragmentOverlay != null) {
+        viewer.getCustomOverlayLayers().remove(fragmentOverlay)
+    }
     
-   DynamicLengthSlider(lilTotalLength, lilStartFragmentLength, lilEndFragmentLength, i) {
-       
-       def totalLength = lilTotalLength/4000
-       def startFragmentLength = lilStartFragmentLength/4000
-       def endFragmentLength = lilEndFragmentLength/4000
-       
+    if (closeWindow == false) {
+        fragmentOverlay = new FragmentOverlay(viewer, sliceBoundaries)
+        viewer.getCustomOverlayLayers().add(fragmentOverlay)
+        viewer.repaint()
+    }    
+}
+
+class DynamicLengthSlider {
+    Runnable changed
+    Runnable onChange
+    double totalLength
+    double startCutLength
+    double endCutLength
+    LengthIndexedLine lila
+    HBox gui
+    Geometry geo
+    double pCC
+    Slider startSlider
+    Slider endSlider
+    int index
+    
+   DynamicLengthSlider(LengthIndexedLine lila, int index, double startCutLength = 5, double endCutLength = 5, double pCC = 4000) {
+       this.lila = lila
+       this.index = index
+       this.totalLength = lila.getEndIndex()
+       this.startCutLength = startCutLength
+       this.endCutLength = endCutLength
+       this.pCC = pCC
+       this.geo = lila.extractLine(startCutLength * pCC, totalLength - (endCutLength * pCC))
+       this.guiCreator(index)
+   }
+   
+   void updateGeo() {
+      this.geo = this.lila.extractLine(this.startCutLength * this.pCC, this.totalLength - (this.endCutLength * this.pCC)) 
+   }
+   
+   void guiCreator(i) {       
        def segmentHBox = new HBox()
        segmentHBox.getChildren().add(new Label(i.toString()))
        
        def startHBox = new HBox()
        startHBox.getChildren().add(new Label("Start"))
-       def startSlider = new Slider(0,totalLength/2, startFragmentLength)
-       startSlider.setShowTickLabels(true)
-       startHBox.getChildren().add(startSlider)
-       def startValue = new Label(startSlider.getValue().toString())
+       this.startSlider = new Slider(0, this.totalLength/this.pCC/2, this.startCutLength)
+       this.startSlider.setShowTickLabels(true)
+       startHBox.getChildren().add(this.startSlider)
+       
+       this.startSlider.valueProperty().addListener((obs, oldVal, newVal) -> {
+           this.startCutLength = newVal
+           this.updateGeo()
+           if (onChange != null)
+               onChange.run()
+       })
+       
+       this.startSlider.valueChangingProperty().addListener((obs, oldValue, changing) -> {
+           if(!changing) {
+               if(changed != null) {
+                  changed.run() 
+               }                   
+           }
+       })
+       
+       def startValue = new Label(this.startSlider.getValue().toString())
        startValue.textProperty().bind(
-           startSlider.valueProperty().asString("%.1f")
+           this.startSlider.valueProperty().asString("%.1f")
        )
        startHBox.getChildren().add(startValue)
-       
 
        
        
        
        def endHBox = new HBox()
        endHBox.getChildren().add(new Label("End"))
-       def endSlider = new Slider(0, totalLength/2, endFragmentLength)
-       endSlider.setShowTickLabels(true)
-       endHBox.getChildren().add(endSlider)
+       this.endSlider = new Slider(0, this.totalLength/this.pCC/2, this.endCutLength)
+       this.endSlider.setShowTickLabels(true)
+       endHBox.getChildren().add(this.endSlider)
+       
+       this.endSlider.valueProperty().addListener((obs, oldVal, newVal) -> {
+           this.endCutLength = newVal
+           this.updateGeo()
+           if (onChange != null)
+               onChange.run()
+       })
+       
+       this.endSlider.valueChangingProperty().addListener((obs, oldValue, changing) -> {
+           if(!changing) {
+               if(changed != null) {
+                  changed.run() 
+               }                   
+           }
+       })
+       
+       
        def endValue = new Label(endSlider.getValue().toString())
        endValue.textProperty().bind(
            endSlider.valueProperty().asString("%.1f")
@@ -774,7 +832,6 @@ class DynamicLengthSlider {
        segmentHBox.getChildren().add(fragmentVBox)
        
        this.gui = segmentHBox
-       
    }
 }
 
@@ -798,7 +855,8 @@ class FragmentOverlay extends AbstractOverlay {
             boolean paintCompletely
     ) {
 
-        slice.fragmentsGUI.flatten().each { geo ->
+        slice.fragmentsGUI.each { dls ->
+            def geo = dls.geo
             def roi = GeometryTools.geometryToROI(geo, ImagePlane.getDefaultPlane())
             Shape shape = roi.getShape()
             g2d.draw(shape)
@@ -810,17 +868,22 @@ class FragmentOverlay extends AbstractOverlay {
 
 updatePathClasses()
 
-def plane = ImagePlane.getDefaultPlane()
 
 def roi = ROIs.createRectangleROI(0, 0, 1, 1, plane)
 
 def geo = roi.getGeometry()
 
 sliceBoundaries = new SliceBoundaries(geo, geo, geo, plane)
+sliceBoundaries.overlayUpdater = {
+    updateOverlay()
+}
 
 Platform.runLater {
 
     Stage stage = new Stage()
+    stage.setOnCloseRequest {event ->
+        updateOverlay(true)
+    }
     
     GridPane grid = new GridPane()
     
@@ -878,13 +941,7 @@ Platform.runLater {
     
     Button measureBtn = new Button("Measure cortical thickness")
     measureBtn.setOnAction {
-        Thread.startDaemon {
-           try {
-              MeasureCT() 
-           } catch (Exception e) {
-              e.printStackTrace() 
-           }
-        }
+        MeasureCT(sliceBoundaries)
     }
     
     GridPane measGrid = new GridPane()
@@ -895,31 +952,10 @@ Platform.runLater {
     sliceBoundaries.fragmentsProperty.addListener { obs, oldValue, newValue ->
         segmentVBox.getChildren().clear()
         
-        for (f in newValue) {
-       
-           def totalLength = f[0].getLength() ?: 0
-           def startFragmentLength = f[1][0].getLength() ?: 0
-           def endFragmentLength = f[1][1].getLength() ?: 0
-           def index = segmentVBox.getChildren().size()
-           def dls = new DynamicLengthSlider(totalLength, startFragmentLength, endFragmentLength, index)           
-           
-           segmentVBox.getChildren().add(dls.gui)
-           
-           def viewer = getCurrentViewer()
-
-           viewer.getCustomOverlayLayers().removeIf {
-               it instanceof FragmentOverlay
-           }
-            
-           viewer.getCustomOverlayLayers().add(
-               new FragmentOverlay(viewer, sliceBoundaries)
-           )
-            
-           viewer.repaint()
-           
-           
-    
+        for (dls in newValue) {    
+           segmentVBox.getChildren().add(dls.gui)   
         }
+    updateOverlay()
     }
 
     
