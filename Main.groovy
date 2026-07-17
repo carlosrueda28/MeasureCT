@@ -11,10 +11,13 @@ import javafx.scene.control.Label
 import javafx.scene.control.ScrollPane
 import javafx.scene.control.Slider
 import javafx.scene.control.TextField
+import javafx.scene.control.TextFormatter
+import javafx.scene.control.CheckBox
 import javafx.scene.layout.GridPane
 import javafx.scene.layout.HBox
 import javafx.scene.layout.VBox
 import javafx.stage.Stage
+import javafx.util.converter.IntegerStringConverter
 
 import org.locationtech.jts.geom.*
 import org.locationtech.jts.geom.util.AffineTransformation
@@ -35,6 +38,7 @@ import qupath.lib.objects.classes.PathClass
 import qupath.lib.regions.ImagePlane
 import qupath.lib.regions.ImageRegion
 import qupath.lib.roi.GeometryTools
+import qupath.lib.gui.viewer.QuPathViewerListener
 
 
 @Field
@@ -58,12 +62,12 @@ class SliceBoundaries {
     Geometry mergedPial
     boolean showFragments
     
-    int lengthTreshold = 30000
+    int lengthTreshold = 28000
     
     Closure overlayUpdater
     
-    SliceBoundaries(Geometry bgGeom, Geometry grGeom, Geometry whGeom, ImagePlane plane) {
-        refresh(bgGeom, grGeom, whGeom, plane)
+    SliceBoundaries(Geometry bgGeom, Geometry grGeom, Geometry whGeom, int lengthTreshold, ImagePlane plane) {
+        refresh(bgGeom, grGeom, whGeom, lengthTreshold, plane)
     }
     
     void updateMergedPial() {
@@ -78,7 +82,7 @@ class SliceBoundaries {
        }
     }
     
-    void refresh(Geometry bgGeom, Geometry grGeom, Geometry whGeom, ImagePlane plane) {
+    void refresh(Geometry bgGeom, Geometry grGeom, Geometry whGeom, int lengthTreshold, ImagePlane plane) {
             //Generate cortical interfaces
             
             def gf = new GeometryFactory()
@@ -86,6 +90,7 @@ class SliceBoundaries {
             this.pial = bgGeom.intersection(grGeom.getBoundary()) //Pial boundary
             this.bound = grGeom.intersection(whGeom.getBoundary()) //gray-white boundary
             this.gray = grGeom
+            this.lengthTreshold = lengthTreshold*4000
             this.validPialSegments = []
             this.fragmentsGUI = []
     
@@ -105,7 +110,7 @@ class SliceBoundaries {
                 */
                 
                 //Ignore small fragments
-                if (m.getLength() < lengthTreshold)
+                if (m.getLength() < this.lengthTreshold)
                     continue
             
                 def endpointCounts = [:]
@@ -193,6 +198,7 @@ class SliceBoundaries {
 
 
 def tileCreation() {
+    updateOverlay(true)
     setImageType('BRIGHTFIELD_H_DAB')
     setColorDeconvolutionStains('{"Name" : "H-DAB default", "Stain 1" : "Hematoxylin", "Values 1" : "0.65111 0.70119 0.29049", "Stain 2" : "DAB", "Values 2" : "0.26917 0.56824 0.77759", "Background" : " 255 255 255"}')
     createFullImageAnnotation(true)
@@ -202,25 +208,13 @@ def tileCreation() {
     resetSelection()
 }
 
-def annCreator(updateOnly = false) { 
+def annCreator(updateOnly = false, MIN_FRAGMENT_SIZE = 500000, MAX_HOLE_SIZE = 500000, 
+                BG_SIMPLIFY = 50, GM_SIMPLIFY = 1000, WM_SIMPLIFY = 1000, BG_BUFFER = 300,
+                WM_BUFFER = 300, GM_BUFFER = 600, LENGTH = 5) {
     // ============================================================================
     // PARAMETERS
     // ============================================================================
-    
-    // Remove small fragments & holes after tile-to-annotation conversion
-    double MIN_FRAGMENT_SIZE = 500_000
-    double MAX_HOLE_SIZE     = 500_000
-    
-    // Geometry simplification tolerances
-    double BG_SIMPLIFY = 500
-    double GM_SIMPLIFY = 1000
-    double WM_SIMPLIFY = 1000
-    
-    // Morphological smoothing buffers
-    double BG_BUFFER = 300
-    double WM_BUFFER = 300
-    double GM_BUFFER = 600
-    
+
     if (updateOnly == false) {
             // ============================================================================
             // CONVERT TILE CLASSIFICATIONS TO CLEAN ANNOTATIONS
@@ -354,7 +348,7 @@ def annCreator(updateOnly = false) {
     // ============================================================================
 
 
-    sliceBoundaries.refresh(backgroundSmooth, graySmooth, whiteSmooth, plane)
+    sliceBoundaries.refresh(backgroundSmooth, graySmooth, whiteSmooth, LENGTH, plane)
 
     
     
@@ -483,53 +477,6 @@ def createCortMeasurements(Geometry from, Geometry to,
 }
 }
 
-def visionCone (line){
-    Coordinate p0 = line.getCoordinateN(0)
-    Coordinate p1 = line.getCoordinateN(1)
-    
-    double dx = p1.x - p0.x
-    double dy = p1.y - p0.y
-    
-    double norm = Math.sqrt(dx*dx + dy*dy)
-    
-    dx /= norm
-    dy /= norm
-    
-    double coneLength = 20000
-    double halfAngle = Math.toRadians(60)
-    
-    double cosA = Math.cos(halfAngle)
-    double sinA = Math.sin(halfAngle)
-    
-    double lx = dx*cosA - dy*sinA
-    double ly = dx*sinA + dy*cosA
-    
-    double rx = dx*cosA + dy*sinA
-    double ry = -dx*sinA + dy*cosA
-    
-    Coordinate apex = p0
-    
-    Coordinate left = new Coordinate(
-        apex.x + lx*coneLength,
-        apex.y + ly*coneLength
-    )
-    
-    Coordinate right = new Coordinate(
-        apex.x + rx*coneLength,
-        apex.y + ry*coneLength
-    )
-    
-    Polygon cone = gf.createPolygon([
-        apex,
-        left,
-        right,
-        apex
-    ] as Coordinate[])
-    
-    roi = GeometryTools.geometryToROI(cone, plane)
-    det = PathObjects.createDetectionObject(roi)
-    addObject(det)
-}
 
 /**
  * Extract only linear geometries from a geometry collection.
@@ -747,15 +694,26 @@ class DynamicLengthSlider {
     double pCC
     Slider startSlider
     Slider endSlider
+    CheckBox validGeom
     int index
     
    DynamicLengthSlider(LengthIndexedLine lila, int index, double startCutLength = 5, double endCutLength = 5, double pCC = 4000) {
        this.lila = lila
+       this.pCC = pCC
        this.index = index
        this.totalLength = lila.getEndIndex()
-       this.startCutLength = startCutLength
-       this.endCutLength = endCutLength
-       this.pCC = pCC
+       if (this.totalLength/this.pCC/2 < startCutLength) {
+          this.startCutLength = this.totalLength/this.pCC/4 
+       } else {
+          this.startCutLength = startCutLength
+       }
+       if (this.totalLength/this.pCC/2 < endCutLength) {
+          this.endCutLength = this.totalLength/this.pCC/4 
+       } else {
+          this.endCutLength = endCutLength
+       }
+       
+       
        this.geo = lila.extractLine(startCutLength * pCC, totalLength - (endCutLength * pCC))
        this.guiCreator(index)
    }
@@ -768,9 +726,11 @@ class DynamicLengthSlider {
        def segmentHBox = new HBox()
        segmentHBox.getChildren().add(new Label(i.toString()))
        
+
+       
        def startHBox = new HBox()
        startHBox.getChildren().add(new Label("Start"))
-       this.startSlider = new Slider(0, this.totalLength/this.pCC/2, this.startCutLength)
+       this.startSlider = new Slider(0, (this.totalLength/this.pCC/2).round(1), this.startCutLength)
        this.startSlider.setShowTickLabels(true)
        startHBox.getChildren().add(this.startSlider)
        
@@ -800,7 +760,7 @@ class DynamicLengthSlider {
        
        def endHBox = new HBox()
        endHBox.getChildren().add(new Label("End"))
-       this.endSlider = new Slider(0, this.totalLength/this.pCC/2, this.endCutLength)
+       this.endSlider = new Slider(0, (this.totalLength/this.pCC/2).round(1), this.endCutLength)
        this.endSlider.setShowTickLabels(true)
        endHBox.getChildren().add(this.endSlider)
        
@@ -830,6 +790,37 @@ class DynamicLengthSlider {
        fragmentVBox.getChildren().add(startHBox)
        fragmentVBox.getChildren().add(endHBox)
        segmentHBox.getChildren().add(fragmentVBox)
+       
+       this.validGeom = new CheckBox("Valid")
+       this.validGeom.setSelected(true)
+       
+       this.validGeom.selectedProperty().addListener { observable, oldValue, newValue ->
+           if(newValue) {
+               //add function
+               this.startSlider.setDisable(false)
+               this.endSlider.setDisable(false)
+               this.updateGeo()
+               if(onChange != null) {
+                  onChange.run() 
+               }
+               if(changed != null) {
+                  changed.run() 
+               } 
+           }else {
+               //add function
+               this.startSlider.setDisable(true)
+               this.endSlider.setDisable(true)
+               this.geo = this.lila.extractLine(0, 0)
+               if(onChange != null) {
+                  onChange.run() 
+               }
+               if(changed != null) {
+                  changed.run() 
+               } 
+           }
+       }
+       
+       segmentHBox.getChildren().add(this.validGeom)
        
        this.gui = segmentHBox
    }
@@ -866,6 +857,35 @@ class FragmentOverlay extends AbstractOverlay {
     }
 }
 
+def createIntegerField = { int defaultValue ->
+
+    def tf = new TextField(defaultValue.toString())
+
+    tf.setTextFormatter(new TextFormatter({ change ->
+        change.text ==~ /[0-9]*/ ? change : null
+    }))
+
+    return tf
+}
+
+def listener = [
+    imageDataChanged: { viewer, oldImageData, newImageData ->
+        println "Image changed"
+
+        updateOverlay(true)
+
+    },
+
+    selectedObjectChanged: { viewer, pathObject -> },
+
+    visibleRegionChanged: { viewer, shape -> },
+
+    viewerClosed: { viewer -> }
+
+] as QuPathViewerListener
+
+getCurrentViewer().addViewerListener(listener)
+
 updatePathClasses()
 
 
@@ -873,13 +893,13 @@ def roi = ROIs.createRectangleROI(0, 0, 1, 1, plane)
 
 def geo = roi.getGeometry()
 
-sliceBoundaries = new SliceBoundaries(geo, geo, geo, plane)
+sliceBoundaries = new SliceBoundaries(geo, geo, geo, 7, plane)
 sliceBoundaries.overlayUpdater = {
     updateOverlay()
 }
 
 Platform.runLater {
-
+    
     Stage stage = new Stage()
     stage.setOnCloseRequest {event ->
         updateOverlay(true)
@@ -907,34 +927,96 @@ Platform.runLater {
     grid.add(new Label("Object classifier"), 0, 1)
     grid.add(classBtn, 1, 1)
     
+    GridPane annGrid = new GridPane()
+    annGrid.add(new Label("Min fragment size"), 0, 0) 
+    annGrid.add(new Label("Max hole size"),0, 1)
+    annGrid.add(new Label("Background simplification"), 0, 2)
+    annGrid.add(new Label("Gray matter simplification"), 0, 3)
+    annGrid.add(new Label("White matter simplification"), 0, 4)
+    annGrid.add(new Label("Background buffer"), 0, 5)
+    annGrid.add(new Label("White matter buffer"), 0, 6)
+    annGrid.add(new Label("Gray matter buffer"), 0, 7)
+    annGrid.add(new Label("Segment Length Treshold"), 0, 8)
+    
+    minText      = createIntegerField(500000)
+    maxText      = createIntegerField(500000)
+    backSimpText = createIntegerField(50)
+    graySimpText = createIntegerField(1000)
+    whtSimpText  = createIntegerField(1000)
+    backBuffText = createIntegerField(300)
+    whtBuffText  = createIntegerField(300)
+    grayBuffText = createIntegerField(600)
+    lengthText   = createIntegerField(7)
+    
+    annGrid.add(minText, 1, 0)
+    annGrid.add(maxText, 1, 1)
+    annGrid.add(backSimpText, 1, 2)
+    annGrid.add(graySimpText, 1, 3)
+    annGrid.add(whtSimpText, 1, 4)
+    annGrid.add(backBuffText, 1, 5)
+    annGrid.add(whtBuffText, 1, 6)
+    annGrid.add(grayBuffText, 1, 7)
+    annGrid.add(lengthText, 1, 8)
+        
+    
     Button annBtn = new Button("Create annotations")
     annBtn.setOnAction {
-        annCreator()
+        
+        int minFragment = minText.text.toInteger()
+        int maxHole     = maxText.text.toInteger()
+        int bgSimplify  = backSimpText.text.toInteger()
+        int gmSimplify  = graySimpText.text.toInteger()
+        int wmSimplify  = whtSimpText.text.toInteger()
+        int bgBuffer    = backBuffText.text.toInteger()
+        int wmBuffer    = whtBuffText.text.toInteger()
+        int gmBuffer    = grayBuffText.text.toInteger()
+        int length      = lengthText.text.toInteger()
+        
+
+        annCreator(
+        false,
+        minFragment,
+        maxHole,
+        bgSimplify,
+        gmSimplify,
+        wmSimplify,
+        bgBuffer,
+        wmBuffer,
+        gmBuffer,
+        length
+        )
     }
     
-    GridPane annGrid = new GridPane()
-    annGrid.add(new Label("Min fragment size"), 0, 0)
-    annGrid.add(new TextField("500000"), 1, 0)
-    annGrid.add(new Label("Max hole size"),0, 1)
-    annGrid.add(new TextField("500000"), 1, 1)
-    annGrid.add(new Label("Background simplification"), 0, 2)
-    annGrid.add(new TextField("500000"), 1, 2)
-    annGrid.add(new Label("Gray matter simplification"), 0, 3)
-    annGrid.add(new TextField("500000"), 1, 3)
-    annGrid.add(new Label("White matter simplification"), 0, 4)
-    annGrid.add(new TextField("500000"), 1, 4)
-    annGrid.add(new Label("Background buffer"), 0, 5)
-    annGrid.add(new TextField("500000"), 1, 5)
-    annGrid.add(new Label("Gray matter buffer"), 0, 6)
-    annGrid.add(new TextField("500000"), 1, 6)
-    annGrid.add(annBtn, 0, 7, 2, 1)
+    annGrid.add(annBtn, 0, 9, 2, 1)
     
     grid.add(new Label("Create annotations"), 0, 2)
     grid.add(annGrid, 1, 2)
     
     Button updateBtn = new Button("Update annotations")
     updateBtn.setOnAction {
-        annCreator(updateOnly = true)
+        int minFragment = minText.text.toInteger()
+        int maxHole     = maxText.text.toInteger()
+        int bgSimplify  = backSimpText.text.toInteger()
+        int gmSimplify  = graySimpText.text.toInteger()
+        int wmSimplify  = whtSimpText.text.toInteger()
+        int bgBuffer    = backBuffText.text.toInteger()
+        int wmBuffer    = whtBuffText.text.toInteger()
+        int gmBuffer    = grayBuffText.text.toInteger()
+        int length      = lengthText.text.toInteger()
+        
+
+        annCreator(
+        true,
+        minFragment,
+        maxHole,
+        bgSimplify,
+        gmSimplify,
+        wmSimplify,
+        bgBuffer,
+        wmBuffer,
+        gmBuffer,
+        length
+        )
     }
     grid.add(new Label("Update annotations"), 0, 3)
     grid.add(updateBtn, 1, 3)
