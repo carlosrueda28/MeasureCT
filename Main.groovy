@@ -13,11 +13,18 @@ import javafx.scene.control.Slider
 import javafx.scene.control.TextField
 import javafx.scene.control.TextFormatter
 import javafx.scene.control.CheckBox
+import javafx.scene.control.TitledPane
 import javafx.scene.layout.GridPane
+import javafx.scene.layout.BorderPane
 import javafx.scene.layout.HBox
 import javafx.scene.layout.VBox
+import javafx.scene.layout.Priority
+import javafx.scene.layout.RowConstraints
 import javafx.stage.Stage
+import javafx.stage.Screen
 import javafx.util.converter.IntegerStringConverter
+import javafx.geometry.Insets
+import javafx.geometry.Pos
 
 import org.locationtech.jts.geom.*
 import org.locationtech.jts.geom.util.AffineTransformation
@@ -35,10 +42,15 @@ import qupath.lib.gui.viewer.overlays.AbstractOverlay
 import qupath.lib.images.ImageData
 import qupath.lib.objects.PathObjects
 import qupath.lib.objects.classes.PathClass
+import qupath.lib.objects.hierarchy.events.PathObjectHierarchyEvent
 import qupath.lib.regions.ImagePlane
 import qupath.lib.regions.ImageRegion
 import qupath.lib.roi.GeometryTools
 import qupath.lib.gui.viewer.QuPathViewerListener
+import qupath.lib.gui.charts.HistogramDisplay
+import qupath.lib.gui.measure.ObservableMeasurementTableData
+
+import qupath.process.gui.commands.ObjectClassifierCommand
 
 
 @Field
@@ -93,8 +105,31 @@ class SliceBoundaries {
             this.lengthTreshold = lengthTreshold*4000
             this.validPialSegments = []
             this.fragmentsGUI = []
+            
+            def p
     
-            def p = LineSequencer.sequence(pial)
+            try {
+                p = LineSequencer.sequence(pial)
+            }
+            catch (org.locationtech.jts.util.AssertionFailedException e) {
+            
+                Dialogs.showErrorMessage(
+                    "Boundary Reconstruction Failed",
+                    """The cortical boundaries could not be reconstructed.
+            
+            This usually happens when the generated annotation boundaries are incomplete or disconnected.
+            
+            Possible causes:
+             • Missing gray or white matter regions
+             • Gaps in the segmentation
+             • Very small disconnected fragments
+             • Invalid annotation geometry
+            
+            Try improving the tissue classification or adjusting the refinement parameters before trying again."""
+                )
+            
+                return
+            }
             
             def merger = new LineMerger()
             merger.add(p)
@@ -215,7 +250,17 @@ def annCreator(updateOnly = false, MIN_FRAGMENT_SIZE = 500000, MAX_HOLE_SIZE = 5
     // PARAMETERS
     // ============================================================================
 
+
+    
     if (updateOnly == false) {
+            
+            if (getAnnotationObjects().isEmpty()) {
+                Dialogs.showErrorMessage(
+                    "Create annotations",
+                    "No annotations with valid classified detections were found.\n\nPlease create and/or classify detections before running this command."
+                )
+                return
+                }
             // ============================================================================
             // CONVERT TILE CLASSIFICATIONS TO CLEAN ANNOTATIONS
             // ============================================================================
@@ -255,6 +300,46 @@ def annCreator(updateOnly = false, MIN_FRAGMENT_SIZE = 500000, MAX_HOLE_SIZE = 5
     def hierarchy   = imageData.getHierarchy()
     def annotations = hierarchy.getAnnotationObjects()
     
+    if (updateOnly == false) {
+        if (getAnnotationObjects().isEmpty()) {
+            Dialogs.showErrorMessage(
+                "Create annotations",
+                "No annotations with valid classified detections were found.\n\nPlease create and/or classify detections before running this command."
+            )
+            return
+        }
+    } else {
+        if (getAnnotationObjects().isEmpty()) {
+            Dialogs.showErrorMessage(
+            "Create annotations",
+            """The required annotations could not be found.
+    
+            Expected annotation classes:
+             • Background
+             • Gray
+             • White
+            
+        Please run the annotations creator first or verify that all three classes exist."""
+        )
+        return
+        }
+    }
+    
+    if (getAnnotationObjects().isEmpty()) {
+        Dialogs.showErrorMessage(
+        "Create annotations",
+        """The required annotations could not be found.
+
+        Expected annotation classes:
+         • Background
+         • Gray
+         • White
+        
+        Please run the classifier first or verify that all three classes exist."""
+    )
+    return
+    }
+    
     def plane = annotations[0].getROI().getImagePlane()
     def gf    = new GeometryFactory()
     
@@ -284,6 +369,15 @@ def annCreator(updateOnly = false, MIN_FRAGMENT_SIZE = 500000, MAX_HOLE_SIZE = 5
                 break
         }
     }
+    
+    if (backgroundGeom == null || grayGeom == null || whiteGeom == null) {
+        Dialogs.showErrorMessage(
+            "Create annotations",
+            "The annotation classes 'Background', 'Gray', and 'White' are required."
+        )
+        return
+    }
+    
     
     
     // ============================================================================
@@ -640,31 +734,51 @@ def updatePathClasses() {
 }
 
 def MeasureCT(SliceBoundaries) {
+    try {
+        def mergedPial = SliceBoundaries.mergedPial
+        def bound = SliceBoundaries.bound
+        def gray = SliceBoundaries.gray
+        
+        
+        
+        //Measurement parameters
+        crossCoords = []
+        crossLines = []
+        step = 1000 // in pixels (1000 pixels == 250um)
+        linesROI = []
+        
+        
+        
+        //Create measurements in both directions
+        createCortMeasurements(mergedPial, bound, gray, "PtoB", linesROI) 
+        createCortMeasurements(bound, mergedPial, gray, "BtoP", linesROI)
+        
+        addObjects(linesROI)
+        //grAnnotation.addChildObjects(linesROI)
+        //grAnnotation.addChildObjects(crossLines) //Debug only
+        selectDetections()
+        addShapeMeasurements("LENGTH")
+        resetSelection()
+    }
+    catch (e) {
+
+        Dialogs.showErrorMessage(
+            "Cortical Thickness Measurement Failed",
+            """Unable to generate cortical thickness measurements.
     
-    def mergedPial = SliceBoundaries.mergedPial
-    def bound = SliceBoundaries.bound
-    def gray = SliceBoundaries.gray
+    The cortical boundary is empty or invalid, so measurement lines could not be created.
     
+    Possible causes:
+     • The pial or white matter boundary was not generated correctly.
+     • The boundary contains empty or disconnected geometries.
+     • The annotation requires refinement before measurements can be computed.
     
+    Please verify the generated annotations and try again."""
+        )
     
-    //Measurement parameters
-    crossCoords = []
-    crossLines = []
-    step = 1000 // in pixels (1000 pixels == 250um)
-    linesROI = []
-    
-    
-    
-    //Create measurements in both directions
-    createCortMeasurements(mergedPial, bound, gray, "PtoB", linesROI) 
-    createCortMeasurements(bound, mergedPial, gray, "BtoP", linesROI)
-    
-    addObjects(linesROI)
-    //grAnnotation.addChildObjects(linesROI)
-    //grAnnotation.addChildObjects(crossLines) //Debug only
-    selectDetections()
-    addShapeMeasurements("LENGTH")
-    resetSelection()
+        return
+    }
+
 }
 
 def updateOverlay(closeWindow = false) {
@@ -714,7 +828,7 @@ class DynamicLengthSlider {
        }
        
        
-       this.geo = lila.extractLine(startCutLength * pCC, totalLength - (endCutLength * pCC))
+       this.geo = lila.extractLine(this.startCutLength * this.pCC, this.totalLength - (this.endCutLength * this.pCC))
        this.guiCreator(index)
    }
    
@@ -725,11 +839,16 @@ class DynamicLengthSlider {
    void guiCreator(i) {       
        def segmentHBox = new HBox()
        segmentHBox.getChildren().add(new Label(i.toString()))
+       segmentHBox.setSpacing(10)
        
 
        
        def startHBox = new HBox()
-       startHBox.getChildren().add(new Label("Start"))
+       startHBox.setSpacing(10)
+       def startLabel = new Label("Start")
+       startLabel.setMinWidth(30)
+       startLabel.setPrefWidth(30)
+       startHBox.getChildren().add(startLabel)
        this.startSlider = new Slider(0, (this.totalLength/this.pCC/2).round(1), this.startCutLength)
        this.startSlider.setShowTickLabels(true)
        startHBox.getChildren().add(this.startSlider)
@@ -754,12 +873,17 @@ class DynamicLengthSlider {
            this.startSlider.valueProperty().asString("%.1f")
        )
        startHBox.getChildren().add(startValue)
+       startHBox.getChildren().add(new Label(" mm"))
 
        
        
        
        def endHBox = new HBox()
-       endHBox.getChildren().add(new Label("End"))
+       endHBox.setSpacing(10)
+       def endLabel   = new Label("End")
+       endLabel.setMinWidth(30)
+       endLabel.setPrefWidth(30)
+       endHBox.getChildren().add(endLabel)
        this.endSlider = new Slider(0, (this.totalLength/this.pCC/2).round(1), this.endCutLength)
        this.endSlider.setShowTickLabels(true)
        endHBox.getChildren().add(this.endSlider)
@@ -785,6 +909,7 @@ class DynamicLengthSlider {
            endSlider.valueProperty().asString("%.1f")
        )
        endHBox.getChildren().add(endValue)
+       endHBox.getChildren().add(new Label(" mm"))
        
        def fragmentVBox = new VBox()
        fragmentVBox.getChildren().add(startHBox)
@@ -845,7 +970,9 @@ class FragmentOverlay extends AbstractOverlay {
             ImageData<BufferedImage> imageData,
             boolean paintCompletely
     ) {
-
+        g2d.setStroke(new BasicStroke(400.0f))
+        g2d.setColor(new Color(255, 0, 0))
+        
         slice.fragmentsGUI.each { dls ->
             def geo = dls.geo
             def roi = GeometryTools.geometryToROI(geo, ImagePlane.getDefaultPlane())
@@ -905,7 +1032,15 @@ Platform.runLater {
         updateOverlay(true)
     }
     
-    GridPane grid = new GridPane()
+    GridPane settingsGrid = new GridPane()
+    settingsGrid.setVgap(20)
+    settingsGrid.setHgap(10)
+    settingsGrid.setPadding(new Insets(10))
+    
+    for (int i = 0; i < 6; i++) {
+    settingsGrid.getRowConstraints().add(new RowConstraints())
+    }
+    
     
     Button tilesBtn = new Button("Run")
     tilesBtn.setOnAction {
@@ -917,19 +1052,22 @@ Platform.runLater {
            }
         }
     }
-    grid.add(new Label("Create tiles"), 0, 0)
-    grid.add(tilesBtn, 1, 0)
+    settingsGrid.add(new Label("Create tiles"), 0, 0)
+    settingsGrid.add(tilesBtn, 1, 0)
     
     Button classBtn = new Button("Open train Object Classifier")
     classBtn.setOnAction {
-        print "run"
+        qupath = QuPathGUI.getInstance()
+        new ObjectClassifierCommand(qupath).run()
     }
-    grid.add(new Label("Object classifier"), 0, 1)
-    grid.add(classBtn, 1, 1)
+    settingsGrid.add(new Label("Object classifier"), 0, 1)
+    settingsGrid.add(classBtn, 1, 1)
     
     GridPane annGrid = new GridPane()
-    annGrid.add(new Label("Min fragment size"), 0, 0) 
+    annGrid.add(new Label("Min fragment size"), 0, 0)
+    annGrid.add(new Label(" µm²"), 2, 0)
     annGrid.add(new Label("Max hole size"),0, 1)
+    annGrid.add(new Label(" µm²"), 2, 1)
     annGrid.add(new Label("Background simplification"), 0, 2)
     annGrid.add(new Label("Gray matter simplification"), 0, 3)
     annGrid.add(new Label("White matter simplification"), 0, 4)
@@ -937,6 +1075,7 @@ Platform.runLater {
     annGrid.add(new Label("White matter buffer"), 0, 6)
     annGrid.add(new Label("Gray matter buffer"), 0, 7)
     annGrid.add(new Label("Segment Length Treshold"), 0, 8)
+    annGrid.add(new Label(" mm"), 2, 8)
     
     minText      = createIntegerField(500000)
     maxText      = createIntegerField(500000)
@@ -958,6 +1097,11 @@ Platform.runLater {
     annGrid.add(grayBuffText, 1, 7)
     annGrid.add(lengthText, 1, 8)
         
+    TitledPane advancedPane = new TitledPane()
+    advancedPane.setText("Advanced options")
+    advancedPane.setContent(annGrid)
+    advancedPane.setExpanded(false)   // collapsed by default
+    advancedPane.setCollapsible(true)
     
     Button annBtn = new Button("Create annotations")
     annBtn.setOnAction {
@@ -987,20 +1131,22 @@ Platform.runLater {
         )
     }
     
-    annGrid.add(annBtn, 0, 9, 2, 1)
+    annVBox = new VBox()
+    annVBox.getChildren().add(advancedPane)
+    annVBox.getChildren().add(annBtn)
     
-    grid.add(new Label("Create annotations"), 0, 2)
-    grid.add(annGrid, 1, 2)
+    settingsGrid.add(new Label("Create annotations"), 0, 2)
+    settingsGrid.add(annVBox, 1, 2)
     
     Button updateBtn = new Button("Update annotations")
     updateBtn.setOnAction {
         int minFragment = minText.text.toInteger()
         int maxHole     = maxText.text.toInteger()
-        int bgSimplify  = backSimpText.text.toInteger()
-        int gmSimplify  = graySimpText.text.toInteger()
-        int wmSimplify  = whtSimpText.text.toInteger()
-        int bgBuffer    = backBuffText.text.toInteger()
-        int wmBuffer    = whtBuffText.text.toInteger()
+        int bgSimplify  = 0//backSimpText.text.toInteger()
+        int gmSimplify  = 0//graySimpText.text.toInteger()
+        int wmSimplify  = 0//whtSimpText.text.toInteger()
+        int bgBuffer    = 100//backBuffText.text.toInteger()
+        int wmBuffer    = 0//whtBuffText.text.toInteger()
         int gmBuffer    = grayBuffText.text.toInteger()
         int length      = lengthText.text.toInteger()
         
@@ -1018,18 +1164,21 @@ Platform.runLater {
         length
         )
     }
-    grid.add(new Label("Update annotations"), 0, 3)
-    grid.add(updateBtn, 1, 3)
+    settingsGrid.add(new Label("Update annotations"), 0, 3)
+    settingsGrid.add(updateBtn, 1, 3)
     
     Button measureBtn = new Button("Measure cortical thickness")
     measureBtn.setOnAction {
         MeasureCT(sliceBoundaries)
     }
     
-    GridPane measGrid = new GridPane()
-    measGrid.add(new Label("Define start and end segments"), 0, 0)
+    BorderPane measurePane = new BorderPane()
+    measurePane.setPadding(new Insets(10))
+    
+    measurePane.setTop(new Label("Define start and end segments"))
     
     VBox segmentVBox = new VBox()
+    segmentVBox.setSpacing(10)
     
     sliceBoundaries.fragmentsProperty.addListener { obs, oldValue, newValue ->
         segmentVBox.getChildren().clear()
@@ -1041,25 +1190,73 @@ Platform.runLater {
     }
 
     
-    measScrollPane = new ScrollPane()
-    measScrollPane.setContent(segmentVBox)
+    measScrollPane = new ScrollPane(segmentVBox)
+    measScrollPane.setFitToWidth(true)
     
-    measGrid.add(measScrollPane, 0, 1, 2, 1)
+    measurePane.setCenter(measScrollPane)
     
-    measGrid.add(measureBtn, 0,2,2,1)
+    HBox measureButtons = new HBox(10)
+    measureButtons.setAlignment(Pos.CENTER_RIGHT)
+    measureButtons.getChildren().add(measureBtn)
     
-    grid.add(new Label("Measure"), 0, 4)
-    grid.add(measGrid, 1, 4)
+    measurePane.setBottom(measureButtons)
     
-    Button showBtn = new Button("Show")
-    grid.add(new Label("Show thickness measurements"), 0, 5)
-    grid.add(showBtn, 1, 5)
 
-    Scene scene = new Scene(grid, 500, 800)
+    
+    model = new ObservableMeasurementTableData()
+    imageData = getCurrentImageData()
+    hierarchy = getCurrentHierarchy()
+    
+    detections = hierarchy.getDetectionObjects().stream()
+        .filter(p -> {
+            pc = p.getPathClass()
+            pc?.toString() in ["PtoB", "BtoP"]
+        })
+        .toList()
+    model.setImageData(imageData, detections)
+    histogram = new HistogramDisplay(model, true)
+    
+    def hierarchyListener = { PathObjectHierarchyEvent event ->
+        def detections = hierarchy.getDetectionObjects().stream()
+            .filter(p -> {
+                pc = p.getPathClass()
+                pc?.toString() in ["PtoB", "BtoP"]
+            })
+            .toList()
+        model.setImageData(imageData, detections)
+        histogram.refreshHistogram()
+    } as qupath.lib.objects.hierarchy.events.PathObjectHierarchyListener
+    
+    hierarchy.addListener(hierarchyListener)
+
+    histogram.getPane().setPrefHeight(150)
+    histogram.showHistogram("Length")
+    
+    BorderPane histogramPane = new BorderPane()
+    histogramPane.setPadding(new Insets(10))
+    histogramPane.setCenter(histogram.getPane())
+    
+    VBox centerBox = new VBox(15)
+    
+    centerBox.getChildren().addAll(
+        settingsGrid,
+        measurePane
+    )
+    
+    VBox.setVgrow(measurePane, Priority.ALWAYS)
+    VBox.setVgrow(measScrollPane, Priority.ALWAYS)
+    
+    BorderPane root = new BorderPane()
+
+    root.setCenter(centerBox)
+    root.setBottom(histogramPane)
+        
+    def bounds = Screen.getPrimary().getVisualBounds()
+    Scene scene = new Scene(root, 500, bounds.getHeight())
     
     stage.setAlwaysOnTop(true)
 
     stage.setScene(scene)
-    stage.setTitle("Cortical measurement")
+    stage.setTitle("Cortical Measurement - by Carlos Rueda (GNA)")
     stage.show()
 }
