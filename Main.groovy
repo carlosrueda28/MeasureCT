@@ -63,6 +63,15 @@ FragmentOverlay fragmentOverlay
 
 @Field ImagePlane plane = ImagePlane.getDefaultPlane()
 
+@Field long nearestSearchTime = 0
+@Field long raycastTime = 0
+
+@Field int nearestCalls = 0
+@Field int raycastCalls = 0
+
+@Field boolean useRayCast = true
+@Field int rayCastCount = 180
+
 class SliceBoundaries {
     
     Geometry pial
@@ -494,9 +503,11 @@ def annCreator(updateOnly = false, MIN_FRAGMENT_SIZE = 500000, MAX_HOLE_SIZE = 5
  */
 
 def createCortMeasurements(Geometry from, Geometry to,
-                            Geometry inside, String lineClass, listLines) {
+                            Geometry inside, String lineClass, listLines, 
+                            useRayCast = true, rayCastCount = 180) {
     //List of valid lines
     def lines = []
+    def detections = []
     def cLines = []
     def prevLine = null
     //List of start coordinate of invalid lines
@@ -507,7 +518,9 @@ def createCortMeasurements(Geometry from, Geometry to,
     def lil = new LengthIndexedLine(from)
     def gf = new GeometryFactory()
     
+    long tNearest
     for (double d = 0; d <= totalLength; d += step) {
+        tNearest = System.nanoTime()
         Coordinate c = lil.extractPoint(d)
         point = gf.createPoint(c)
         pair = DistanceOp.nearestPoints(point, to)
@@ -527,40 +540,59 @@ def createCortMeasurements(Geometry from, Geometry to,
         if (! inside.covers(lineSegment)) {
            crossCoords << c
            cLines << line
+           nearestSearchTime += System.nanoTime() - tNearest
+           nearestCalls++
            //visionCone(prevLine)
         }
         
         //checks if line is less than 5mm, if not is invalid
         else if (line.getLength()/4000 >= 5) { 
+            nearestSearchTime += System.nanoTime() - tNearest
+            nearestCalls++
         }
         
         else {
-           lines << line
-           prevLine = line
-        }
+           roi = GeometryTools.geometryToROI(line, plane)
+           pathClass = PathClass.fromString("Nearest: ${lineClass}")
+           detection = PathObjects.createDetectionObject(roi)
+           detection.setPathClass(pathClass)
+           detections << detection
+           nearestSearchTime += System.nanoTime() - tNearest
+           nearestCalls++
+        }        
     }
     
     
     
-    //Make raycast 
+    // Make raycast only if enabled
     
-    for (coord in crossCoords) {
-       line = rayCast(coord, to, inside)
-       if (! line) { 
-       }
-       else if (line.getLength()/4000 >= 5) {
-       }
-       else {
-           lines << line
-       }
+    if (useRayCast) {
+        for (coord in crossCoords) {
     
-    //Convert geometries to QuPath detections
-    for (l in lines) {
-        roi = GeometryTools.geometryToROI(l, plane)
-        pathClass = PathClass.fromString(lineClass)
-        detection = PathObjects.createDetectionObject(roi)
-        detection.setPathClass(PathClass.fromString(lineClass))
-        listLines << detection 
+            line = rayCast(
+                coord,
+                to,
+                inside,
+                rayCastCount
+            )
+    
+            if (!line) {
+            }
+            else if (line.getLength()/4000 >= 5) {
+            }
+            else {
+                roi = GeometryTools.geometryToROI(line, plane)
+                pathClass = PathClass.fromString("Ray: ${lineClass}")
+                detection = PathObjects.createDetectionObject(roi)
+                detection.setPathClass(pathClass)
+                detections << detection
+            }
+        }
+    }
+    
+        //Convert geometries to QuPath detections
+    for (d in detections) {
+        listLines << d
         }
         
     for (l in cLines) {
@@ -568,7 +600,6 @@ def createCortMeasurements(Geometry from, Geometry to,
         detection = PathObjects.createDetectionObject(roi)
         crossLines << detection 
         }
-}
 }
 
 
@@ -605,6 +636,8 @@ def extractLines(Geometry geom) {
 def rayCast(Coordinate coord, Geometry to, Geometry inside,
                           int n = 180, double maxDist = 1e6) {
 
+    long t0 = System.nanoTime()
+    
     def gf = new GeometryFactory()
     
     def validRays = []
@@ -700,10 +733,16 @@ def rayCast(Coordinate coord, Geometry to, Geometry inside,
         validRays << clippedRay
     }
 
-    if (validRays.isEmpty())
+    if (validRays.isEmpty()){
+        raycastTime += System.nanoTime() - t0
+        raycastCalls++
         return null
+    }
 
     // ---- return shortest ----
+    
+    raycastTime += System.nanoTime() - t0
+    raycastCalls++
     return validRays.min { r -> r.getLength() }
 }
 
@@ -714,12 +753,17 @@ def updatePathClasses() {
     
     def projectClasses = new ArrayList<>(project.getPathClasses())
     
+    def nearestPC = PathClass.getInstance("Nearest")
+    def rayPC= PathClass.getInstance("Ray")
+    
     def requestedClasses = [
                         PathClass.getInstance("Background", ColorTools.BLACK),
                         PathClass.getInstance("Gray", ColorTools.CYAN), 
                         PathClass.getInstance("White", ColorTools.WHITE),
-                        PathClass.getInstance("PtoB", ColorTools.makeRGB(128, 0, 128)),
-                        PathClass.getInstance("BtoP", ColorTools.MAGENTA)
+                        PathClass.getInstance(nearestPC, "PtoB", ColorTools.makeRGB(128, 0, 128)),
+                        PathClass.getInstance(nearestPC, "BtoP", ColorTools.MAGENTA),
+                        PathClass.getInstance(rayPC, "PtoB", ColorTools.makeRGB(0, 255, 0)),
+                        PathClass.getInstance(rayPC, "BtoP", ColorTools.makeRGB(26, 77, 26)),
                         ]
     
     requestedClasses.each { c ->
@@ -733,52 +777,113 @@ def updatePathClasses() {
 //debug //print projectClasses
 }
 
-def MeasureCT(SliceBoundaries) {
-    try {
-        def mergedPial = SliceBoundaries.mergedPial
-        def bound = SliceBoundaries.bound
-        def gray = SliceBoundaries.gray
-        
-        
-        
-        //Measurement parameters
-        crossCoords = []
-        crossLines = []
-        step = 1000 // in pixels (1000 pixels == 250um)
-        linesROI = []
-        
-        
-        
-        //Create measurements in both directions
-        createCortMeasurements(mergedPial, bound, gray, "PtoB", linesROI) 
-        createCortMeasurements(bound, mergedPial, gray, "BtoP", linesROI)
-        
-        addObjects(linesROI)
-        //grAnnotation.addChildObjects(linesROI)
-        //grAnnotation.addChildObjects(crossLines) //Debug only
-        selectDetections()
-        addShapeMeasurements("LENGTH")
-        resetSelection()
-    }
-    catch (e) {
+def MeasureCT(SliceBoundaries, useRayCast = true, rayCastCount = 180) {
 
-        Dialogs.showErrorMessage(
-            "Cortical Thickness Measurement Failed",
-            """Unable to generate cortical thickness measurements.
+    nearestSearchTime = 0
+    raycastTime = 0
     
-    The cortical boundary is empty or invalid, so measurement lines could not be created.
+    nearestCalls = 0
+    raycastCalls = 0
     
-    Possible causes:
-     • The pial or white matter boundary was not generated correctly.
-     • The boundary contains empty or disconnected geometries.
-     • The annotation requires refinement before measurements can be computed.
+    long t0 = System.nanoTime()
+    def mergedPial = SliceBoundaries.mergedPial
+    def bound = SliceBoundaries.bound
+    def gray = SliceBoundaries.gray
     
-    Please verify the generated annotations and try again."""
-        )
     
+    
+    //Measurement parameters
+    crossCoords = []
+    crossLines = []
+    step = 1000 // in pixels (1000 pixels == 250um)
+    linesROI = []
+    
+    
+    
+    //Create measurements in both directions
+    createCortMeasurements(
+        mergedPial,
+        bound,
+        gray,
+        "PtoB",
+        linesROI,
+        useRayCast,
+        rayCastCount
+    )
+    
+    createCortMeasurements(
+        bound,
+        mergedPial,
+        gray,
+        "BtoP",
+        linesROI,
+        useRayCast,
+        rayCastCount
+    )
+    
+    addObjects(linesROI)
+    //grAnnotation.addChildObjects(linesROI)
+    //grAnnotation.addChildObjects(crossLines) //Debug only
+    selectDetections()
+    addShapeMeasurements("LENGTH")
+    resetSelection()
+    
+    getCurrentHierarchy().fireHierarchyChangedEvent(this)
+    
+    long t1 = System.nanoTime()
+    
+    println String.format("""
+    ========================================
+    MeasureCT Profile
+    ========================================
+    Total execution : %.3f s
+    
+    Nearest search
+    --------------
+    Calls           : %d
+    Total           : %.3f s
+    Average         : %.3f ms
+    
+    Ray casting
+    -----------
+    Calls           : %d
+    Total           : %.3f s
+    Average         : %.3f ms
+    ========================================
+    """,
+    (t1 - t0) / 1e9,
+    
+    nearestCalls,
+    nearestSearchTime / 1e9,
+    nearestCalls > 0 ? nearestSearchTime / 1e6 / nearestCalls : 0.0,
+    
+    raycastCalls,
+    raycastTime / 1e9,
+    raycastCalls > 0 ? raycastTime / 1e6 / raycastCalls : 0.0
+    )
+}
+
+def deleteCTMeasurements() {
+
+    def hierarchy = getCurrentHierarchy()
+
+    def ctDetections = hierarchy.getDetectionObjects().findAll { detection ->
+        def pc = detection.getPathClass()?.toString()
+
+        pc in [
+            "Nearest: PtoB",
+            "Nearest: BtoP",
+            "Ray: PtoB",
+            "Ray: BtoP"
+        ]
+    }
+
+    if (ctDetections.isEmpty())
         return
-    }
 
+    hierarchy.removeObjects(ctDetections, true)
+
+    hierarchy.fireHierarchyChangedEvent(this)
 }
 
 def updateOverlay(closeWindow = false) {
@@ -995,6 +1100,22 @@ def createIntegerField = { int defaultValue ->
     return tf
 }
 
+def hasCTMeasurements() {
+
+    def hierarchy = getCurrentHierarchy()
+
+    return hierarchy.getDetectionObjects().any { detection ->
+        def pc = detection.getPathClass()?.toString()
+
+        pc in [
+            "Nearest: PtoB",
+            "Nearest: BtoP",
+            "Ray: PtoB",
+            "Ray: BtoP"
+        ]
+    }
+}
+
 def listener = [
     imageDataChanged: { viewer, oldImageData, newImageData ->
         println "Image changed"
@@ -1009,7 +1130,7 @@ def listener = [
 
     viewerClosed: { viewer -> }
 
-] as QuPathViewerListener
+    ] as QuPathViewerListener
 
 getCurrentViewer().addViewerListener(listener)
 
@@ -1138,55 +1259,276 @@ Platform.runLater {
     settingsGrid.add(new Label("Create annotations"), 0, 2)
     settingsGrid.add(annVBox, 1, 2)
     
+    // ============================================================================
+    // UPDATE ANNOTATIONS - ADVANCED OPTIONS
+    // ============================================================================
+    
+    GridPane updateAnnGrid = new GridPane()
+    updateAnnGrid.setVgap(10)
+    updateAnnGrid.setHgap(10)
+    
+    updateAnnGrid.add(new Label("Min fragment size"), 0, 0)
+    updateAnnGrid.add(new Label(" µm²"), 2, 0)
+    
+    updateAnnGrid.add(new Label("Max hole size"), 0, 1)
+    updateAnnGrid.add(new Label(" µm²"), 2, 1)
+    
+    updateAnnGrid.add(new Label("Background simplification"), 0, 2)
+    updateAnnGrid.add(new Label("Gray matter simplification"), 0, 3)
+    updateAnnGrid.add(new Label("White matter simplification"), 0, 4)
+    
+    updateAnnGrid.add(new Label("Background buffer"), 0, 5)
+    updateAnnGrid.add(new Label("White matter buffer"), 0, 6)
+    updateAnnGrid.add(new Label("Gray matter buffer"), 0, 7)
+    
+    updateAnnGrid.add(new Label("Segment Length Threshold"), 0, 8)
+    updateAnnGrid.add(new Label(" mm"), 2, 8)
+    
+    
+    // ============================================================================
+    // UPDATE ANNOTATIONS - PARAMETERS
+    // ============================================================================
+    
+    TextField updateMinText      = createIntegerField(500000)
+    TextField updateMaxText      = createIntegerField(500000)
+    
+    TextField updateBackSimpText = createIntegerField(0)
+    TextField updateGraySimpText = createIntegerField(0)
+    TextField updateWhtSimpText  = createIntegerField(0)
+    
+    TextField updateBackBuffText = createIntegerField(100)
+    TextField updateWhtBuffText  = createIntegerField(0)
+    TextField updateGrayBuffText = createIntegerField(600)
+    
+    TextField updateLengthText   = createIntegerField(7)
+    
+    updateAnnGrid.add(updateMinText,      1, 0)
+    updateAnnGrid.add(updateMaxText,      1, 1)
+    updateAnnGrid.add(updateBackSimpText, 1, 2)
+    updateAnnGrid.add(updateGraySimpText, 1, 3)
+    updateAnnGrid.add(updateWhtSimpText,  1, 4)
+    updateAnnGrid.add(updateBackBuffText, 1, 5)
+    updateAnnGrid.add(updateWhtBuffText,  1, 6)
+    updateAnnGrid.add(updateGrayBuffText, 1, 7)
+    updateAnnGrid.add(updateLengthText,   1, 8)
+    
+    
+    // ============================================================================
+    // UPDATE ANNOTATIONS - ADVANCED OPTIONS
+    // ============================================================================
+    
+    TitledPane updateAdvancedPane = new TitledPane(
+        "Advanced options",
+        updateAnnGrid
+    )
+    
+    updateAdvancedPane.setExpanded(false)
+    updateAdvancedPane.setCollapsible(true)
+    
+    
+    // ============================================================================
+    // UPDATE BUTTON
+    // ============================================================================
+    
     Button updateBtn = new Button("Update annotations")
+    
     updateBtn.setOnAction {
-        int minFragment = minText.text.toInteger()
-        int maxHole     = maxText.text.toInteger()
-        int bgSimplify  = 0//backSimpText.text.toInteger()
-        int gmSimplify  = 0//graySimpText.text.toInteger()
-        int wmSimplify  = 0//whtSimpText.text.toInteger()
-        int bgBuffer    = 100//backBuffText.text.toInteger()
-        int wmBuffer    = 0//whtBuffText.text.toInteger()
-        int gmBuffer    = grayBuffText.text.toInteger()
-        int length      = lengthText.text.toInteger()
-        
-
+    
+        int minFragment = updateMinText.text.toInteger()
+        int maxHole     = updateMaxText.text.toInteger()
+    
+        int bgSimplify  = updateBackSimpText.text.toInteger()
+        int gmSimplify  = updateGraySimpText.text.toInteger()
+        int wmSimplify  = updateWhtSimpText.text.toInteger()
+    
+        int bgBuffer    = updateBackBuffText.text.toInteger()
+        int wmBuffer    = updateWhtBuffText.text.toInteger()
+        int gmBuffer    = updateGrayBuffText.text.toInteger()
+    
+        int length      = updateLengthText.text.toInteger()
+    
         annCreator(
-        true,
-        minFragment,
-        maxHole,
-        bgSimplify,
-        gmSimplify,
-        wmSimplify,
-        bgBuffer,
-        wmBuffer,
-        gmBuffer,
-        length
+            true,
+            minFragment,
+            maxHole,
+            bgSimplify,
+            gmSimplify,
+            wmSimplify,
+            bgBuffer,
+            wmBuffer,
+            gmBuffer,
+            length
         )
     }
+    
+    
+    // ============================================================================
+    // UPDATE ANNOTATIONS - GUI
+    // ============================================================================
+    
+    VBox updateVBox = new VBox(10)
+    
+    updateVBox.getChildren().add(updateAdvancedPane)
+    updateVBox.getChildren().add(updateBtn)
+    
     settingsGrid.add(new Label("Update annotations"), 0, 3)
-    settingsGrid.add(updateBtn, 1, 3)
+    settingsGrid.add(updateVBox, 1, 3)
+    
+    CheckBox rayCastCheck = new CheckBox("Use ray casting")
+    rayCastCheck.setSelected(true)
+    
+    TextField rayCastNumberText = createIntegerField(180)
+    rayCastNumberText.setPrefWidth(80)
+    
+    HBox rayCastSettings = new HBox(10)
+    rayCastSettings.setAlignment(Pos.CENTER_LEFT)
+    
+    rayCastSettings.getChildren().addAll(
+        rayCastCheck,
+        new Label("Number of rays:"),
+        rayCastNumberText
+    )
     
     Button measureBtn = new Button("Measure cortical thickness")
     measureBtn.setOnAction {
-        MeasureCT(sliceBoundaries)
+    
+        boolean useRayCastNow = rayCastCheck.isSelected()
+        int rayCastCountNow = rayCastNumberText.text.toInteger()
+    
+        if (rayCastCountNow < 1) {
+            Dialogs.showErrorMessage(
+                "Invalid ray-casting settings",
+                "The number of rays must be at least 1."
+            )
+            return
+        }
+    
+        MeasureCT(
+            sliceBoundaries,
+            useRayCastNow,
+            rayCastCountNow
+        )
+    }
+    
+    Button deleteMeasurementsBtn = new Button("Delete all measurements")
+
+    deleteMeasurementsBtn.setDisable(
+        !hasCTMeasurements()
+    )
+    
+    deleteMeasurementsBtn.setOnAction {
+    
+        deleteCTMeasurements()
+    
+        deleteMeasurementsBtn.setDisable(
+            !hasCTMeasurements()
+        )
     }
     
     BorderPane measurePane = new BorderPane()
     measurePane.setPadding(new Insets(10))
     
-    measurePane.setTop(new Label("Define start and end segments"))
+    // ============================================================
+    // DEFINE START AND END SEGMENTS
+    // ============================================================
+    
+    CheckBox selectAllSegments = new CheckBox("Select all segments")
+    selectAllSegments.setSelected(true)
     
     VBox segmentVBox = new VBox()
     segmentVBox.setSpacing(10)
     
-    sliceBoundaries.fragmentsProperty.addListener { obs, oldValue, newValue ->
-        segmentVBox.getChildren().clear()
-        
-        for (dls in newValue) {    
-           segmentVBox.getChildren().add(dls.gui)   
+    // Header containing title + select-all checkbox
+    VBox segmentHeader = new VBox(5)
+    segmentHeader.getChildren().add(
+        new Label("Define start and end segments")
+    )
+    segmentHeader.getChildren().add(
+        selectAllSegments
+    )
+    
+    measurePane.setTop(segmentHeader)
+    
+    boolean updatingSelectAll = false
+    
+    selectAllSegments.selectedProperty().addListener { obs, oldValue, newValue ->
+    
+        if (updatingSelectAll)
+            return
+    
+        updatingSelectAll = true
+    
+        try {
+    
+            sliceBoundaries.fragmentsGUI.each { dls ->
+    
+                if (dls.validGeom.isSelected() != newValue) {
+                    dls.validGeom.setSelected(newValue)
+                }
+    
+            }
+    
+        } finally {
+    
+            updatingSelectAll = false
         }
-    updateOverlay()
+    
+        updateOverlay()
+    }
+    
+    
+    def updateSelectAllCheckbox = {
+    
+        if (updatingSelectAll)
+            return
+    
+        def fragments = sliceBoundaries.fragmentsGUI
+    
+        if (fragments == null || fragments.isEmpty()) {
+            updatingSelectAll = true
+            try {
+                selectAllSegments.setSelected(false)
+            } finally {
+                updatingSelectAll = false
+            }
+            return
+        }
+    
+        boolean allSelected = fragments.every { dls ->
+            dls.validGeom.isSelected()
+        }
+    
+        if (selectAllSegments.isSelected() != allSelected) {
+    
+            updatingSelectAll = true
+    
+            try {
+                selectAllSegments.setSelected(allSelected)
+            } finally {
+                updatingSelectAll = false
+            }
+        }
+    }
+    
+    
+    sliceBoundaries.fragmentsProperty.addListener { obs, oldValue, newValue ->
+    
+        segmentVBox.getChildren().clear()
+    
+        for (dls in newValue) {
+            segmentVBox.getChildren().add(dls.gui)
+    
+            // Listen for individual Valid checkbox changes
+            dls.validGeom.selectedProperty().addListener { obs2, oldVal, newVal ->
+    
+                updateSelectAllCheckbox()
+    
+            }
+        }
+    
+        updateSelectAllCheckbox()
+    
+        updateOverlay()
     }
 
     
@@ -1195,11 +1537,20 @@ Platform.runLater {
     
     measurePane.setCenter(measScrollPane)
     
+    VBox measureControls = new VBox(10)
+    
+    measureControls.getChildren().add(rayCastSettings)
+    
     HBox measureButtons = new HBox(10)
     measureButtons.setAlignment(Pos.CENTER_RIGHT)
-    measureButtons.getChildren().add(measureBtn)
     
-    measurePane.setBottom(measureButtons)
+    measureButtons.getChildren().add(measureBtn)
+    measureButtons.getChildren().add(deleteMeasurementsBtn)
+    
+    measureControls.getChildren().add(measureButtons)
+
+    
+    measurePane.setBottom(measureControls)
     
 
     
@@ -1210,7 +1561,10 @@ Platform.runLater {
     detections = hierarchy.getDetectionObjects().stream()
         .filter(p -> {
             pc = p.getPathClass()
-            pc?.toString() in ["PtoB", "BtoP"]
+            pc?.toString() in [
+            "Nearest: PtoB", "Nearest: BtoP",
+            "Ray: PtoB", "Ray: BtoP"
+            ]
         })
         .toList()
     model.setImageData(imageData, detections)
@@ -1220,11 +1574,19 @@ Platform.runLater {
         def detections = hierarchy.getDetectionObjects().stream()
             .filter(p -> {
                 pc = p.getPathClass()
-                pc?.toString() in ["PtoB", "BtoP"]
+                pc?.toString() in [
+                    "Nearest: PtoB", "Nearest: BtoP", 
+                    "Ray: PtoB", "Ray: BtoP"
+                    ]
             })
             .toList()
         model.setImageData(imageData, detections)
         histogram.refreshHistogram()
+        
+        // Enable/disable delete button according to CT measurements
+        deleteMeasurementsBtn.setDisable(
+        !hasCTMeasurements()
+    )
     } as qupath.lib.objects.hierarchy.events.PathObjectHierarchyListener
     
     hierarchy.addListener(hierarchyListener)
